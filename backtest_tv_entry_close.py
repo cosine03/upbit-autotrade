@@ -29,10 +29,16 @@ def to_utc_ts(x) -> pd.Timestamp:
     return pd.Timestamp(x, tz="UTC")
 
 def next_bar_open_idx(ohlcv_15m: pd.DataFrame, signal_ts: pd.Timestamp) -> int:
-    """시그널 직후 '다음 봉' 오픈 인덱스(15m 데이터 기준)"""
-    ts = pd.to_datetime(ohlcv_15m["ts"], utc=True).to_numpy()
-    sig_ts = to_utc_ts(signal_ts)
-    return int(np.searchsorted(ts, sig_ts.to_datetime64(), side="right"))
+    """
+    시그널 직후 '다음 봉' 오픈 인덱스(15m 데이터 기준).
+    tz 문제를 피하려고 둘 다 ns 정수로 변환해서 비교합니다.
+    """
+    # 15m ts → UTC → int64(ns)
+    ts_ns = pd.to_datetime(ohlcv_15m["ts"], utc=True).astype("int64").to_numpy()
+    # signal ts → UTC → int64(ns)
+    sig_ns = to_utc_ts(signal_ts).value  # pandas Timestamp의 ns 정수
+
+    return int(np.searchsorted(ts_ns, sig_ns, side="right"))
 
 def ensure_ts(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
