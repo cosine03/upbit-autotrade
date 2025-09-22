@@ -94,13 +94,38 @@ def load_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
     raw.to_csv(p, index=False)
     return raw
 
-def next_bar_open_idx(ohlcv: pd.DataFrame, signal_ts: pd.Timestamp) -> int:
-    """시그널 직후 첫 번째 bar의 인덱스(다음 캔들 시가)"""
-    ts = ohlcv["ts"].to_numpy()
-    # signal_ts가 포함된 bar 이후 첫 bar
-    # (bar ts가 봉의 시작이라면, strictly greater)
-    idx = np.searchsorted(ts, np.datetime64(signal_ts), side="right")
+def ensure_utc_index(df):
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex):
+        if idx.tz is None:
+            df = df.tz_localize("UTC")
+        else:
+            df = df.tz_convert("UTC")
+    return df
+
+ohlcv = get_ohlcv(sym, timeframe)
+ohlcv = ensure_utc_index(ohlcv)
+
+def next_bar_open_idx(ohlcv: pd.DataFrame, signal_ts) -> int:
+    # 1) OHLCV 인덱스는 반드시 UTC
+    ts = ohlcv.index
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+
+    # 2) 시그널 시각도 UTC로 통일
+    sig_ts = pd.to_datetime(signal_ts, utc=True)
+
+    # 3) 바로 '판다스 인덱스'의 searchsorted 사용 (numpy 말고!)
+    #    side="right" → 시그널이 뜬 '다음 봉 오픈'을 진입 시점으로
+    idx = ts.searchsorted(sig_ts, side="right")
+
+    # 범위 방어
+    if idx >= len(ts):
+        idx = len(ts) - 1
     return int(idx)
+
 
 def expiry_close_idx(ohlcv: pd.DataFrame, entry_ts: pd.Timestamp, hours: int) -> int:
     """만기(엔트리+hours) 이후 첫 번째 bar의 '종가' 기준으로 청산될 인덱스(그 bar의 close 사용)."""
@@ -165,6 +190,7 @@ def simulate(symbol: str, sig_ts_list: List[pd.Timestamp], tp: float, sl: float)
             "ret": ret
         })
         open_until = exit_time  # 이 시간 전까지는 재진입 금지
+
 
     # 집계
     if trades:
