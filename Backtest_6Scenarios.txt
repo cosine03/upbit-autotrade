@@ -1,0 +1,9 @@
+# TV 전용
+python backtest_tv_multi_strategies.py
+# (또는 특정 파일 지정)
+python backtest_tv_multi_strategies.py ./logs/signals_tv.csv
+
+# Upbit 전용
+python backtest_upbit_multi_strategies.py
+# (또는 특정 파일 지정)
+python backtest_upbit_multi_strategies.py ./logs/signals_upbit.csv
