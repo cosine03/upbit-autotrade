@@ -22,6 +22,8 @@ import numpy as np
 # pip install pyupbit python-dotenv
 import pyupbit
 
+from sr_engine.data import get_ohlcv
+
 INPUT_PATH_DEFAULT = "./logs/signals_tv.csv"
 OUT_RESULTS = "./logs/bt_tv_results.csv"
 OUT_TRADES  = "./logs/bt_tv_trades.csv"
