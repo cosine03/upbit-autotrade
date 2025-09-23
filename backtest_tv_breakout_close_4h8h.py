@@ -61,14 +61,24 @@ def to_utc_ts(s) -> pd.Timestamp:
 
 
 def series_to_ns_utc(s: pd.Series) -> np.ndarray:
-    """UTC-aware Series를 datetime64[ns] numpy로 변환 (tz-naive 안전 처리)."""
-    if not isinstance(s, pd.Series):
-        s = pd.Series(s)
+    """
+    OHLCV의 ts Series를 'UTC 기준 tz-naive datetime64[ns]' numpy 배열로 통일.
+    tz-aware면 UTC로 맞춘 뒤 tz를 제거하고, tz-naive면 UTC로 가정해 ns로 변환.
+    """
+    # s를 반드시 pandas Series datetime으로
+    s = pd.to_datetime(s, errors="coerce", utc=False)
 
-    s = pd.to_datetime(s, errors="coerce", utc=True)  # UTC-aware로 통일
-    # tz 제거 (naive로 바꾼 후 numpy 변환)
-    s = s.dt.tz_convert("UTC").dt.tz_localize(None)
-    return s.to_numpy(dtype="datetime64[ns]")
+    # tz-aware 인지 판별
+    if isinstance(s.dtype, pd.DatetimeTZDtype):
+        # UTC로 맞추고 tz 제거 → tz-naive
+        s = s.dt.tz_convert("UTC").dt.tz_localize(None)
+    else:
+        # 이미 tz-naive라면 UTC로 간주(Upbit/TV 모두 UTC 타임스탬프 기반)
+        # 혹시 섞여있을 수 있으니 한번 더 보정
+        s = s.dt.tz_localize(None)
+
+    # 이제 tz-naive 상태이므로 안전하게 ns로 변환
+    return s.astype("datetime64[ns]").to_numpy()
 
 
 def idx_of_bar(ts64: np.ndarray, key_ts: pd.Timestamp) -> int:
@@ -213,13 +223,16 @@ def simulate_symbol(
     out = []
 
     for _, s in sig_rows.iterrows():
-        sig_ts = to_utc_ts(s["ts"])
-        side = str(s.get("side", "resistance")).lower()
-        if side != "resistance":
-            # 롱 전용: 저항 돌파 케이스만 사용
-            continue
+    sig_ts = pd.to_datetime(s["ts"], utc=True, errors="coerce")
 
-        i_sig = idx_of_bar(ts64, sig_ts)      # 신호가 발생한 바
+    # tz-aware → UTC로 맞추고 tz 제거
+    if sig_ts.tzinfo is not None:
+        sig_ts = sig_ts.tz_convert("UTC").tz_localize(None)
+    else:
+        sig_ts = sig_ts.tz_localize(None)
+
+    # numpy datetime64[ns] 로 변환
+    sig_ts64 = np.datetime64(sig_ts, "ns")
         i_ent = i_sig + 1                     # 다음 바 종가로 진입
         if i_ent >= len(ohlcv):
             continue
