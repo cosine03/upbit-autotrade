@@ -222,17 +222,17 @@ def simulate_symbol(
 
     out = []
 
-    for _, s in sig_rows.iterrows():
-    sig_ts = pd.to_datetime(s["ts"], utc=True, errors="coerce")
+    for s in rows.itertuples():
+        # 신호 시간 변환
+        sig_ts = pd.to_datetime(s.ts, utc=True, errors="coerce")
+        sig_ts = (sig_ts.tz_convert("UTC").tz_localize(None)
+                  if sig_ts.tzinfo is not None else sig_ts.tz_localize(None))
+        sig_ts64 = np.datetime64(sig_ts, "ns")
 
-    # tz-aware → UTC로 맞추고 tz 제거
-    if sig_ts.tzinfo is not None:
-        sig_ts = sig_ts.tz_convert("UTC").tz_localize(None)
-    else:
-        sig_ts = sig_ts.tz_localize(None)
-
-    # numpy datetime64[ns] 로 변환
-    sig_ts64 = np.datetime64(sig_ts, "ns")
+        i_sig = idx_of_bar(ts, sig_ts64)
+        if i_sig < 0 or i_sig >= len(ts)-1:
+            print(f"[DBG] {sym} skip: sig_ts={s.ts} -> {sig_ts} (i_sig={i_sig})")
+            continue
         i_ent = i_sig + 1                     # 다음 바 종가로 진입
         if i_ent >= len(ohlcv):
             continue
