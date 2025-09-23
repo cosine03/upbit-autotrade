@@ -23,12 +23,25 @@ def ensure_outdir(path):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
 
-def ts_to_ns(s: pd.Series):
-    """Convert to numpy datetime64[ns] UTC-naive"""
-    if pd.api.types.is_datetime64_any_dtype(s):
-        return s.dt.tz_localize(None).astype("datetime64[ns]").to_numpy()
+def ts_to_ns(values):
+    """
+    Any of: Series/Index/list/ndarray of timestamps/ISO strings.
+    -> numpy int64 nanoseconds (tz-naive, UTC-based).
+    """
+    ser = pd.to_datetime(values, errors="coerce", utc=True)
+
+    # Series vs DatetimeIndex 각각 처리
+    if isinstance(ser, pd.Series):
+        ser = ser.dt.tz_convert("UTC").dt.tz_localize(None)  # tz-aware -> naive
+        # pandas 권장 방식으로 ns 배열 생성
+        return ser.to_numpy(dtype="datetime64[ns]").astype("int64")
+    elif isinstance(ser, pd.DatetimeIndex):
+        ser = ser.tz_convert("UTC").tz_localize(None)
+        return ser.to_numpy(dtype="datetime64[ns]").astype("int64")
     else:
-        return pd.to_datetime(s, utc=True, errors="coerce").tz_localize(None).astype("datetime64[ns]").to_numpy()
+        # 다른 타입(예: ndarray)도 일단 Series로 감싸 동일 처리
+        ser = pd.Series(ser).dt.tz_convert("UTC").dt.tz_localize(None)
+        return ser.to_numpy(dtype="datetime64[ns]").astype("int64")
 
 # -----------------------------
 # Core simulation
@@ -37,6 +50,7 @@ def simulate_symbol(symbol, df_sig, timeframe, tp, sl, fee_rt, expiries_h):
     # 여기서는 간단화: 실제 OHLCV 로딩은 더미 처리 (실전에서는 API/DB 필요)
     trades = []
     ts_arr = ts_to_ns(df_sig["ts"])
+    ohlcv_ts = ts_to_ns(ohlcv["ts"])
 
     for i, row in df_sig.iterrows():
         sig_ts = pd.to_datetime(row["ts"], utc=True).tz_localize(None)
