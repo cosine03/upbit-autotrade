@@ -61,19 +61,14 @@ def to_utc_ts(s) -> pd.Timestamp:
 
 
 def series_to_ns_utc(s: pd.Series) -> np.ndarray:
-    """UTC-aware Series를 datetime64[ns] numpy로 변환."""
+    """UTC-aware Series를 datetime64[ns] numpy로 변환 (tz-naive 안전 처리)."""
     if not isinstance(s, pd.Series):
         s = pd.Series(s)
-    # s 가 tz-naive면 로컬라이즈, tz-aware면 convert
-    if pd.api.types.is_datetime64_any_dtype(s):
-        # pandas의 tz 인식 확인
-        if getattr(s.dt, "tz", None) is None:
-            s = s.dt.tz_localize("UTC")
-        else:
-            s = s.dt.tz_convert("UTC")
-    else:
-        s = pd.to_datetime(s, utc=True, errors="coerce")
-    return s.astype("datetime64[ns]").to_numpy()
+
+    s = pd.to_datetime(s, errors="coerce", utc=True)  # UTC-aware로 통일
+    # tz 제거 (naive로 바꾼 후 numpy 변환)
+    s = s.dt.tz_convert("UTC").dt.tz_localize(None)
+    return s.to_numpy(dtype="datetime64[ns]")
 
 
 def idx_of_bar(ts64: np.ndarray, key_ts: pd.Timestamp) -> int:
