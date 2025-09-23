@@ -9,14 +9,14 @@ Upbit Autotrade Repositary I Use with Charty Harry
 
 
 $logA = ".\logs\tv_mp_alt_$(Get-Date -Format yyyyMMdd_HHmm).log"
-python backtest_tv_entry_close_mp.py .\logs\signals_tv.csv --group alt --expiry 4h,8h --procs 6 `
+python backtest_tv_entry_close_mp.py .\logs\signals_tv.csv --group alt --expiry 4h,8h --procs 20 `
   | Tee-Object -FilePath $logA -Append
 
 창 B (UPBIT ALT):
 
 
 $logB = ".\logs\upbit_mp_alt_$(Get-Date -Format yyyyMMdd_HHmm).log"
-python backtest_upbit_multi_strategies_mp.py .\logs\signals_upbit.csv --group alt --horizon 24h --procs 6 `
+python backtest_upbit_multi_strategies_mp.py .\logs\signals_upbit.csv --group alt --horizon 24h --procs 20 `
   | Tee-Object -FilePath $logB -Append
 
 > 메모: --procs는 코어 여유에 맞춰 조절(보통 CPU코어-1). 두 잡을 동시에 돌릴 땐 각 4~6 정도로 낮추면 안정적.

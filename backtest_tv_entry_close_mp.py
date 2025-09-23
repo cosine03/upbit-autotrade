@@ -16,6 +16,26 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 MAJOR = {"KRW-BTC", "KRW-ETH"}
 
+def ensure_ts_utc(df: pd.DataFrame) -> pd.DataFrame:
+    """df['ts']를 UTC tz-aware로 통일하고 오름차순 정렬"""
+    df = df.copy()
+    if "ts" in df.columns:
+        df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    else:
+        ts = None
+        if isinstance(df.index, pd.DatetimeIndex):
+            ts = df.index
+        else:
+            for cand in ("timestamp", "time", "datetime", "date"):
+                if cand in df.columns:
+                    ts = pd.to_datetime(df[cand], utc=True, errors="coerce")
+                    break
+        if ts is None:
+            raise RuntimeError("No timestamp column/index to normalize")
+        df["ts"] = pd.to_datetime(ts, utc=True, errors="coerce")
+    df = df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    return df
+
 def load_signals(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     # 표준 컬럼 정리
@@ -57,9 +77,15 @@ def get_ohlcv_cached(symbol: str, timeframe: str) -> pd.DataFrame:
     df.to_csv(p, index=False)
     return df
 
-def next_bar_open_idx(ohlcv: pd.DataFrame, sig_ts_utc: pd.Timestamp) -> int:
-    ts = ohlcv["ts"].to_numpy()
-    return int(np.searchsorted(ts, sig_ts_utc.to_datetime64(), side="right"))
+def next_bar_open_idx(df: pd.DataFrame, sig_ts) -> int:
+    """
+    sig_ts가 속한 캔들의 다음 캔들 오픈 인덱스를 반환.
+    내부 비교는 모두 '나노초 정수' 축에서 수행(충돌 없음).
+    """
+    df = ensure_ts_utc(df)
+    arr_ns = df["ts"].astype("int64").to_numpy()        # UTC ns
+    sig_ns = pd.to_datetime(sig_ts, utc=True).value     # UTC ns(int)
+    return int(np.searchsorted(arr_ns, sig_ns, side="right"))
 
 def _fees_roundtrip(pct: float) -> float:
     # 왕복 0.1% → -0.001
