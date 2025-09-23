@@ -1,26 +1,53 @@
 # -*- coding: utf-8 -*-
 """
-backtest_tv_events_mp.py  (TV 알람 4종 멀티프로세싱 백테스트)
-- 엔트리 정확도 보강: distance_pct 필터 (--dist-max, 기본 0.25%)
-- TP 고정 1.5% / SL 상향 1.25% (기본값) / 수수료 roundtrip 기본 0.1% (=0.001)
-- 만기 4h, 8h 동시 평가
-- 빈 OHLCV 대응: 재시도 + 캐시(csv) + UTC 정규화
-- 멀티프로세싱 기본 24프로세스
+TV 이벤트(backtest) 멀티프로세싱 버전 (안정화)
 
-사용 예:
-  python backtest_tv_events_mp.py .\logs\signals_tv.csv --timeframe 15m --expiries 4h,8h --tp 1.5 --sl 1.25 --fee 0.001 --dist-max 0.25 --procs 24
+- 이벤트 그룹별( detected / price_in_box / box_breakout / line_breakout ) 롱 온리
+- 엔트리: '신호봉 다음 봉의 종가'가 (저항 기준) 레벨 위에서 마감하면 롱 진입
+  * support 쪽 신호는 롱에서 무시(필요시 옵션화 가능)
+- TP/SL: 퍼센트 (기본 TP 1.5%, SL 1.25%), 수수료 왕복 fee(기본 0.1%) 적용
+- 만기: 다중 만기 (기본 4h,8h)
+- signals_tv_enriched.csv에 존재 가능: distance_pct → --dist-max 로 필터
+- 빈 OHLCV나 tz 문제, 피클링 에러(워커 반환 시) 방어
+
+예시 실행(Windows PowerShell):
+python backtest_tv_events_mp.py .\logs\signals_tv.csv ^
+  --timeframe 15m ^
+  --expiries 4h,8h ^
+  --tp 1.5 ^
+  --sl 1.25 ^
+  --fee 0.001 ^
+  --dist-max 0.25 ^
+  --procs 24
 """
-import os, sys, argparse, time, hashlib, itertools
-from functools import lru_cache
-from typing import List, Tuple, Dict, Optional
 
+import os, sys, csv, math, uuid, tempfile, traceback
+from typing import List, Tuple, Dict, Optional
 import numpy as np
 import pandas as pd
+from multiprocessing import Pool, get_start_method, set_start_method
 
-# === 프로젝트 내 최소 의존: get_ohlcv ===
-from sr_engine.data import get_ohlcv
+# ---- 프로젝트 함수 로드 ----
+try:
+    from sr_engine.data import get_ohlcv
+except Exception:
+    get_ohlcv = None
 
-# --------------------- 공통 유틸 ---------------------
+# ---------- 유틸 ----------
+def parse_expiries(s: str) -> List[float]:
+    out = []
+    for tok in (s or "").split(","):
+        tok = tok.strip().lower()
+        if not tok: 
+            continue
+        if tok.endswith("h"):
+            out.append(float(tok[:-1]))
+        elif tok.endswith("m"):
+            out.append(float(tok[:-1]) / 60.0)
+        else:
+            out.append(float(tok))
+    return out or [4.0, 8.0]
+
 def tf_minutes(tf: str) -> int:
     s = tf.strip().lower()
     if s.endswith("m"): return int(s[:-1])
@@ -28,351 +55,373 @@ def tf_minutes(tf: str) -> int:
     if s.endswith("d"): return int(s[:-1]) * 60 * 24
     return 15
 
-def safe_to_utc_series(s: pd.Series) -> pd.Series:
-    """Series를 UTC-aware로 통일."""
-    if pd.api.types.is_datetime64_any_dtype(s):
-        # tz-aware?
-        if getattr(s.dt, 'tz', None) is not None:
-            return s.dt.tz_convert("UTC")
-        return s.dt.tz_localize("UTC")
-    # 문자열/숫자 등
-    return pd.to_datetime(s, utc=True, errors="coerce")
-
-def series_to_ns_utc(s: pd.Series) -> np.ndarray:
-    """UTC-aware 시계를 int64(ns) ndarray로."""
-    s = safe_to_utc_series(s)
-    # tz-aware → ns
-    return s.view("int64").to_numpy()
-
-def parse_sig_ts(x) -> pd.Timestamp:
-    """신호 ts 파싱 → UTC-aware Timestamp"""
-    return pd.to_datetime(x, utc=True, errors="coerce")
-
-def expiry_to_hours_list(s: str) -> List[float]:
-    out = []
-    for part in s.split(","):
-        part = part.strip().lower()
-        if not part: continue
-        if part.endswith("h"):
-            out.append(float(part[:-1]))
-        elif part.endswith("d"):
-            out.append(float(part[:-1]) * 24.0)
+def ensure_ts_col(df: pd.DataFrame) -> pd.DataFrame:
+    """OHLCV에 ts 컬럼 보장 + UTC tz-aware → np.datetime64 라인에서 비교 안전"""
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    df = df.copy()
+    # ts 확보
+    if "ts" not in df.columns:
+        if isinstance(df.index, pd.DatetimeIndex):
+            ts = df.index
         else:
-            out.append(float(part))  # 시간 단위로 간주
-    return out
-
-def cache_path(symbol: str, timeframe: str) -> str:
-    h = hashlib.md5(f"{symbol}|{timeframe}".encode()).hexdigest()[:8]
-    os.makedirs("./cache_ohlcv", exist_ok=True)
-    return f"./cache_ohlcv/{symbol.replace('/','_')}_{timeframe}_{h}.csv"
-
-@lru_cache(maxsize=256)
-def load_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
-    """
-    - 캐시(csv) → API(재시도) → 빈 DF
-    - 컬럼: ts, open, high, low, close
-    - ts: UTC-aware
-    """
-    cp = cache_path(symbol, timeframe)
-    # 1) 캐시
-    if os.path.exists(cp):
-        try:
-            dfc = pd.read_csv(cp)
-            if "ts" in dfc:
-                dfc["ts"] = safe_to_utc_series(dfc["ts"])
-            need = {"ts", "open", "high", "low", "close"}
-            if need.issubset(dfc.columns):
-                dfc = (dfc[list(need)]
-                       .dropna(subset=list(need))
-                       .sort_values("ts")
-                       .reset_index(drop=True))
-                if not dfc.empty:
-                    return dfc
-        except Exception:
-            pass
-
-    # 2) API 재시도
-    for wait in (0.7, 1.4, 2.0, 3.0):
-        df = get_ohlcv(symbol, timeframe)
-        if df is not None and len(df) > 0:
-            # 인덱스/컬럼 상황에 따라 ts 생성
-            if isinstance(df.index, pd.DatetimeIndex):
-                ts = df.index
-                ts = ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
-                d2 = df.copy()
-                d2["ts"] = ts
-                d2 = d2.reset_index(drop=True)
+            # 흔한 후보
+            for c in ("time","timestamp","datetime","date"):
+                if c in df.columns:
+                    ts = pd.to_datetime(df[c], errors="coerce", utc=True)
+                    break
             else:
-                d2 = df.reset_index(drop=False)
-                # ts 후보 찾기
-                ts_col = None
-                for c in d2.columns:
-                    if pd.api.types.is_datetime64_any_dtype(d2[c]):
-                        ts_col = c; break
-                if ts_col is None:
-                    for cand in ("ts","index","timestamp","time","datetime","date"):
-                        if cand in d2.columns:
-                            parsed = pd.to_datetime(d2[cand], utc=True, errors="coerce")
-                            if parsed.notna().any():
-                                d2["ts"] = parsed; ts_col = "ts"; break
-                if ts_col is None and "ts" not in d2.columns:
-                    print(f"[{symbol}] OHLCV missing datetime column; skipping.")
-                    return pd.DataFrame()
-                if "ts" not in d2.columns:
-                    d2 = d2.rename(columns={ts_col:"ts"})
-                    d2["ts"] = pd.to_datetime(d2["ts"], utc=True, errors="coerce")
+                # 마지막 수단: 인덱스를 시간으로 간주
+                ts = pd.to_datetime(df.index, errors="coerce", utc=True)
+        if ts.tz is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        df["ts"] = ts
+    else:
+        ts = pd.to_datetime(df["ts"], errors="coerce", utc=True)
+        if ts.tz is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        df["ts"] = ts
+    # 정렬/정리
+    keep_cols = [c for c in ["ts","open","high","low","close","volume"] if c in df.columns]
+    df = df[keep_cols].dropna(subset=["ts","open","high","low","close"]).sort_values("ts")
+    df = df.reset_index(drop=True)
+    return df
 
-            need = ["ts","open","high","low","close"]
-            d2 = (d2[need]
-                  .dropna(subset=need)
-                  .sort_values("ts")
-                  .reset_index(drop=True))
-            try:
-                d2.to_csv(cp, index=False)
-            except Exception:
-                pass
-            return d2
-        time.sleep(wait)
+def ts_series_to_ns64(s: pd.Series) -> np.ndarray:
+    """UTC-aware 시리즈를 np.datetime64[ns] 배열로."""
+    # pandas 2.x: tz-aware → .dt.tz_convert('UTC').view('int64') 권장X
+    # 안전 경로: astype('datetime64[ns, UTC]') → tz-localize None → ns64
+    if hasattr(s, "dt"):
+        s2 = pd.to_datetime(s.dt.tz_convert("UTC"), utc=True, errors="coerce")
+    else:
+        s2 = pd.to_datetime(s, utc=True, errors="coerce")
+    s2 = s2.dt.tz_convert("UTC").dt.tz_localize(None)
+    return s2.astype("datetime64[ns]").to_numpy()
 
-    print(f"[{symbol}] get_ohlcv returned empty.")
-    return pd.DataFrame()
+def to_npdt64(t: pd.Timestamp) -> np.datetime64:
+    # tz-aware → UTC → naive → to numpy datetime64
+    if not isinstance(t, pd.Timestamp):
+        t = pd.Timestamp(t, utc=True)
+    else:
+        t = t.tz_convert("UTC") if t.tzinfo else t.tz_localize("UTC")
+    t = t.tz_localize(None)
+    return t.to_datetime64()
 
-def idx_of_bar(ts64: np.ndarray, key_ts: pd.Timestamp) -> int:
-    """
-    시그널이 발생한 봉의 인덱스(닫힌 봉 기준)를 반환.
-    ts64: ns int64 배열(UTC)
-    key_ts: UTC-aware Timestamp
-    """
-    key64 = np.datetime64(key_ts.to_datetime64())
-    idx = int(np.searchsorted(ts64, key64, side="right")) - 1
-    return max(0, idx)
+def fee_roundtrip(pct: float) -> float:
+    # 왕복 수수료 pct → 단순 차감용
+    return max(0.0, float(pct))
 
-def bars_until(ts64: np.ndarray, start_i: int, hours: float, tf_min: int) -> int:
-    """start_i부터 hours가 지나는 인덱스(만기 직전까지)를 대략 계산."""
-    bars = int(np.ceil((hours * 60) / tf_min))
-    return min(len(ts64) - 1, start_i + bars)
-
-def simulate_symbol(
-    symbol: str,
-    ohlcv: pd.DataFrame,
-    rows: pd.DataFrame,
-    timeframe: str,
-    tp_pct: float,
-    sl_pct: float,
-    fee_rt: float,
-    exp_hours: float
-) -> pd.DataFrame:
-    """
-    시그널 단위로 다음 봉 오픈에 진입(롱), TP/SL/만기으로 청산.
-    동시히트 시 SL 우선(보수적).
-    """
-    if ohlcv is None or ohlcv.empty or rows.empty:
+# ---------- OHLCV 로드 ----------
+def load_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
+    try:
+        if get_ohlcv is None:
+            raise RuntimeError("sr_engine.data.get_ohlcv not available")
+        raw = get_ohlcv(symbol, timeframe)
+        if raw is None or len(raw) == 0:
+            print(f"[{symbol}] get_ohlcv returned empty.")
+            return pd.DataFrame()
+        df = raw.reset_index(drop=False) if isinstance(raw.index, pd.DatetimeIndex) and "ts" not in raw.columns else raw.copy()
+        df = ensure_ts_col(df)
+        return df
+    except Exception as e:
+        print(f"[{symbol}] OHLCV load error: {repr(e)}")
         return pd.DataFrame()
 
-    ts64 = series_to_ns_utc(ohlcv["ts"])
-    open_ = ohlcv["open"].to_numpy(dtype=float, copy=False)
-    high_ = ohlcv["high"].to_numpy(dtype=float, copy=False)
-    low__ = ohlcv["low"].to_numpy(dtype=float, copy=False)
-    close = ohlcv["close"].to_numpy(dtype=float, copy=False)
-    tf_min = tf_minutes(timeframe)
+# ---------- 엔트리 판단 (롱/저항만) ----------
+def breakout_close_entry(ohlcv: pd.DataFrame, sig_ts: pd.Timestamp, level_price: Optional[float]) -> Optional[Tuple[int, float]]:
+    """
+    신호봉 다음 봉의 '종가'가 level_price 위에서 마감하면 엔트리.
+    level_price가 None이면 신호 시점 종가를 레벨 대용으로 사용(근사).
+    반환: (엔트리 인덱스, 엔트리 가격) or None
+    """
+    if ohlcv.empty: 
+        return None
+    ts64 = ts_series_to_ns64(ohlcv["ts"])
+    # 신호봉 인덱스(소속 봉)
+    key64 = to_npdt64(sig_ts)
+    i_sig = int(np.searchsorted(ts64, key64, side="right")) - 1
+    if i_sig < 0 or i_sig+1 >= len(ohlcv):
+        return None
+    # 다음 봉 종가가 레벨 위?
+    close_next = float(ohlcv["close"].iloc[i_sig+1])
+    ref_level = float(level_price) if level_price is not None and np.isfinite(level_price) else float(ohlcv["close"].iloc[i_sig])
+    if close_next > ref_level:
+        return (i_sig+1, close_next)
+    return None
 
-    out = []
-    for s in rows.itertuples(index=False):
-        sig_ts = parse_sig_ts(getattr(s, "ts", None))
-        side = getattr(s, "side", "support")
-        event = getattr(s, "event", "")
-        if pd.isna(sig_ts):
+# ---------- 포지션 시뮬 ----------
+def simulate_rows_for_symbol(symbol: str,
+                             df_sig: pd.DataFrame,
+                             ohlcv: pd.DataFrame,
+                             tp_pct: float,
+                             sl_pct: float,
+                             fee_rt: float,
+                             expiries_h: List[float]) -> List[Dict]:
+    """
+    df_sig: 해당 심볼+이벤트 그룹에 속하는 row들 (ts, event, side, level, touches, message, level_estimate?)
+    롱온리: side=='resistance' 만 사용.
+    TP/SL는 엔트리 기준 퍼센트.
+    만기 리스트 각각 평가.
+    """
+    out: List[Dict] = []
+    if ohlcv.empty or df_sig.empty:
+        return out
+
+    # 오프셋 캐시
+    ts_arr = ohlcv["ts"].to_numpy()
+    ts64 = ts_series_to_ns64(ohlcv["ts"])
+    opens = ohlcv["open"].to_numpy()
+    highs = ohlcv["high"].to_numpy()
+    lows  = ohlcv["low"].to_numpy()
+    closes= ohlcv["close"].to_numpy()
+
+    bar_minutes = tf_minutes("15m")  # 실행 CLI에서 timeframe=15m만 쓰는 중이라면 고정도 OK. 원하면 파라미터로 교체.
+    # 정확히 하려면 timeframe 인수로 받아도 됨.
+
+    for s in df_sig.itertuples():
+        # side 필터(롱=저항만)
+        if str(s.side).lower() != "resistance":
+            continue
+        # 신호 시각 UTC
+        sig_ts = pd.to_datetime(getattr(s, "ts"), utc=True, errors="coerce")
+        if sig_ts is pd.NaT:
             continue
 
-        i_sig = idx_of_bar(ts64, sig_ts)
-        i_ent = i_sig + 1
-        if i_ent >= len(ohlcv):
+        # level_estimate(or None)
+        level_est = getattr(s, "level_estimate", None)
+        try:
+            level_est = float(level_est) if level_est is not None and str(level_est) not in ("", "nan") else None
+        except:
+            level_est = None
+
+        entry = breakout_close_entry(ohlcv, sig_ts, level_est)
+        if entry is None:
             continue
+        i_ent, px_ent = entry
 
-        # 롱 온리
-        px_e = float(open_[i_ent])
-        tp_px = px_e * (1.0 + tp_pct)
-        sl_px = px_e * (1.0 - sl_pct)
+        # TP/SL 절대가
+        tp_price = px_ent * (1.0 + tp_pct/100.0)
+        sl_price = px_ent * (1.0 - sl_pct/100.0)
 
-        # 만기 인덱스
-        i_last = bars_until(ts64, i_ent, exp_hours, tf_min)
-
-        exit_px = float(close[i_last])
-        exit_ts = pd.to_datetime(ts64[i_last]).tz_localize("UTC")
-        reason = "expiry"
-
-        # 각 봉에서 TP/SL 충돌 체크 (SL 먼저)
-        for i in range(i_ent, i_last + 1):
-            lo = float(low__[i]); hi = float(high_[i])
-            if lo <= sl_px:
-                exit_px = sl_px
-                exit_ts = pd.to_datetime(ts64[i]).tz_localize("UTC")
-                reason = "SL"
-                break
-            if hi >= tp_px:
-                exit_px = tp_px
-                exit_ts = pd.to_datetime(ts64[i]).tz_localize("UTC")
-                reason = "TP"
-                break
-
-        # 수수료(왕복): fee_rt
-        gross = (exit_px / px_e) - 1.0
-        net = gross - fee_rt
-
-        out.append({
-            "symbol": symbol,
-            "event": event,
-            "side": side,
-            "entry_ts": pd.to_datetime(ts64[i_ent]).tz_localize("UTC").isoformat(),
-            "entry_px": px_e,
-            "exit_ts": exit_ts.isoformat(),
-            "exit_px": exit_px,
-            "reason": reason,
-            "tp": round(tp_pct*100, 3),
-            "sl": round(sl_pct*100, 3),
-            "expiry_h": float(exp_hours),
-            "gross": gross,
-            "net": net,
-        })
-
-    return pd.DataFrame(out)
-
-def agg_stats(df: pd.DataFrame) -> pd.Series:
-    if df.empty:
-        return pd.Series({"trades": 0, "win_rate": np.nan, "avg_net": np.nan, "median_net": np.nan, "total_net": 0.0})
-    wins = (df["net"] > 0).mean() if len(df) else 0.0
-    return pd.Series({
-        "trades": float(len(df)),
-        "win_rate": float(wins),
-        "avg_net": float(df["net"].mean()),
-        "median_net": float(df["net"].median()),
-        "total_net": float(df["net"].sum()),
-    })
-
-# --------------------- 메인 로직 ---------------------
-EVENT_GROUPS = {
-    "detected": {"level2_detected", "level3_detected"},
-    "price_in_box": {"price_in_box"},
-    "box_breakout": {"box_breakout"},
-    "line_breakout": {"line_breakout"},
-}
-
-def run_group(
-    df_sig: pd.DataFrame,
-    group: str,
-    timeframe: str,
-    tp_pct: float,
-    sl_pct: float,
-    fee_rt: float,
-    expiries_h: List[float],
-    procs: int
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    from multiprocessing import get_context
-    symbols = sorted(df_sig["symbol"].unique().tolist())
-    tasks = []
-    for sym in symbols:
-        ohlcv = load_ohlcv(sym, timeframe)  # 캐시+재시도
-        if ohlcv is None or ohlcv.empty:
-            continue
-        rows = df_sig[df_sig["symbol"] == sym].copy()
-        if rows.empty:
-            continue
+        # 각 만기별 평가
         for eh in expiries_h:
-            tasks.append((sym, ohlcv, rows, timeframe, tp_pct, sl_pct, fee_rt, float(eh)))
+            end_ts = sig_ts + pd.Timedelta(hours=float(eh))
+            end64  = to_npdt64(end_ts)
+            # 엔트리 이후 ~ 만기 전 범위
+            i_end = int(np.searchsorted(ts64, end64, side="left"))
+            if i_end <= i_ent:
+                continue
+            # 고저 터치로 TP/SL 순서 판단
+            # 같은 봉에서 동시 체결 모호성 → SL 우선(보수적) 또는 high/low 순서로 로직
+            hit = None
+            for i in range(i_ent+1, i_end+1):
+                h = float(highs[i]); l = float(lows[i])
+                if l <= sl_price:  # SL first
+                    hit = ("SL", i)
+                    break
+                if h >= tp_price:
+                    hit = ("TP", i)
+                    break
+            if hit is None:
+                # 만기 종가 청산
+                px_exit = float(closes[i_end-1])
+                label   = "EXP"
+            else:
+                kind, i_hit = hit
+                px_exit = float(opens[i_hit])  # 체결 보수적으로 다음 캔들 시가/혹은 해당 봉 종가 등 정책 가능
+                label = kind
 
-    print(f"[BT][{group}] start: symbols={len(symbols)} rows={len(df_sig)} tasks={len(tasks)} procs={procs}")
+            gross = (px_exit - px_ent) / px_ent
+            net   = gross - fee_roundtrip(fee_rt)
+            out.append({
+                "symbol": symbol,
+                "event": getattr(s, "event", ""),
+                "side": getattr(s, "side", ""),
+                "level": int(getattr(s, "level", 0) or 0),
+                "touches": int(getattr(s, "touches", 0) or 0),
+                "ts": str(sig_ts.isoformat()),
+                "entry_idx": int(i_ent),
+                "entry_px": float(px_ent),
+                "exit_label": label,
+                "exit_idx": int(i_end if hit is None else i_hit),
+                "exit_px": float(px_exit),
+                "tp_pct": float(tp_pct),
+                "sl_pct": float(sl_pct),
+                "expiry_h": float(eh),
+                "fee_rt": float(fee_rt),
+                "net": float(net),
+            })
+    return out
 
-    parts: List[pd.DataFrame] = []
-    if not tasks:
+# ---------- 워커(파일로 반환) ----------
+def worker_simulate_to_csv(tmp_dir: str,
+                           symbol: str,
+                           timeframe: str,
+                           rows_for_symbol: pd.DataFrame,
+                           tp_pct: float,
+                           sl_pct: float,
+                           fee_rt: float,
+                           expiries_h: List[float]) -> Optional[str]:
+    try:
+        ohlcv = load_ohlcv(symbol, timeframe)
+        trades = simulate_rows_for_symbol(symbol, rows_for_symbol, ohlcv, tp_pct, sl_pct, fee_rt, expiries_h)
+        if not trades:
+            return None
+        df = pd.DataFrame(trades)
+        # numpy dtype → 표준화
+        for c in df.columns:
+            if df[c].dtype == "object":
+                continue
+            if pd.api.types.is_integer_dtype(df[c]) or pd.api.types.is_float_dtype(df[c]):
+                df[c] = df[c].astype(float) if pd.api.types.is_float_dtype(df[c]) else df[c].astype(int)
+        path = os.path.join(tmp_dir, f"{symbol}_{uuid.uuid4().hex}.csv")
+        df.to_csv(path, index=False, encoding="utf-8")
+        return path
+    except Exception as e:
+        # 워커 예외도 파일로 남김
+        err_path = os.path.join(tmp_dir, f"ERR_{symbol}_{uuid.uuid4().hex}.txt")
+        with open(err_path, "w", encoding="utf-8") as f:
+            f.write(repr(e) + "\n" + traceback.format_exc())
+        return None
+
+# ---------- 그룹 실행 ----------
+def run_group(dfg: pd.DataFrame, group_name: str, timeframe: str,
+              tp_pct: float, sl_pct: float, fee_rt: float, expiries_h: List[float],
+              procs: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    syms = sorted(dfg["symbol"].unique().tolist())
+    print(f"[BT][{group_name}] start: symbols={len(syms)} rows={len(dfg)} tasks={len(syms)} procs={procs}")
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"bt_{group_name}_")
+    tasks = []
+    for sym in syms:
+        rows = dfg[dfg["symbol"] == sym].copy()
+        tasks.append((tmp_dir, sym, timeframe, rows, tp_pct, sl_pct, fee_rt, expiries_h))
+
+    paths = []
+    if procs and procs > 1:
+        # Windows: spawn
+        if get_start_method(allow_none=True) != "spawn":
+            try:
+                set_start_method("spawn", force=True)
+            except RuntimeError:
+                pass
+        with Pool(processes=procs) as pool:
+            paths = pool.starmap(worker_simulate_to_csv, tasks)
+    else:
+        for t in tasks:
+            paths.append(worker_simulate_to_csv(*t))
+
+    # 결과 모으기
+    csv_paths = [p for p in paths if p and os.path.isfile(p) and not os.path.basename(p).startswith("ERR_")]
+    if not csv_paths:
+        print(f"[BT][{group_name}] no trades.")
         return pd.DataFrame(), pd.DataFrame()
 
-    with get_context("spawn").Pool(processes=procs) as pool:
-        parts = pool.starmap(simulate_symbol, tasks)
+    parts = [pd.read_csv(p) for p in csv_paths]
+    trades = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
-    trades = pd.concat([p for p in parts if p is not None and not p.empty], ignore_index=True) if parts else pd.DataFrame()
-    stats = (trades.groupby(["expiry_h"], as_index=False).apply(agg_stats)
-             if not trades.empty else pd.DataFrame())
+    # 집계
+    def agg(df: pd.DataFrame) -> pd.Series:
+        if df.empty:
+            return pd.Series({"trades":0, "win_rate":np.nan, "avg_net":np.nan, "median_net":np.nan, "total_net":np.nan})
+        wins = (df["net"] > 0).sum()
+        return pd.Series({
+            "trades": float(len(df)),
+            "win_rate": float(wins) / float(len(df)),
+            "avg_net": float(df["net"].mean()),
+            "median_net": float(df["net"].median()),
+            "total_net": float(df["net"].sum()),
+        })
+
+    stats = trades.groupby("expiry_h", as_index=False, dropna=False).apply(agg)
+    print(f"[BT][{group_name}] trades -> {len(trades)} rows; stats rows={len(stats)}")
     return trades, stats
 
+# ---------- 메인 ----------
 def main():
+    import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("signals", help="signals_tv.csv 경로(또는 enriched csv)")
+    ap.add_argument("signals", help="signals_tv.csv (또는 *_enriched.csv)")
     ap.add_argument("--timeframe", default="15m")
-    ap.add_argument("--expiries", default="4h,8h", help="예: 4h,8h")
-    ap.add_argument("--tp", type=float, default=1.5, help="TP % (예: 1.5)")
-    ap.add_argument("--sl", type=float, default=1.25, help="SL % (예: 1.25)")
-    ap.add_argument("--fee", type=float, default=0.001, help="왕복 수수료 비율 (기본 0.001=0.1%)")
+    ap.add_argument("--expiries", default="4h,8h")
+    ap.add_argument("--tp", type=float, default=1.5)
+    ap.add_argument("--sl", type=float, default=1.25)   # 요청: SL 1.25로 상향
+    ap.add_argument("--fee", type=float, default=0.001) # 왕복 0.1%
+    ap.add_argument("--dist-max", type=float, default=None, help="distance_pct <= dist_max 필터(예: 0.25)")
     ap.add_argument("--procs", type=int, default=24)
-    ap.add_argument("--dist-max", type=float, default=0.25, help="distance_pct 필터 (절대값 %) — 열 없으면 미적용")
     args = ap.parse_args()
 
-    expiries_h = expiry_to_hours_list(args.expiries)
-    tp_pct = args.tp / 100.0
-    sl_pct = args.sl / 100.0
-
     df = pd.read_csv(args.signals)
-    # 표준화
-    need_cols = ["ts","event","side","symbol"]
-    for c in need_cols:
-        if c not in df.columns:
-            df[c] = ""
-    df["ts"] = parse_sig_ts(df["ts"])
-    df = df.dropna(subset=["ts","event","side","symbol"]).reset_index(drop=True)
+    # UTC 파싱
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    df = df.dropna(subset=["ts","event","symbol","side"])
+    df["event"] = df["event"].str.strip().str.lower()
+    df["side"]  = df["side"].str.strip().str.lower()
+    if "touches" in df.columns:
+        df["touches"] = pd.to_numeric(df["touches"], errors="coerce").fillna(0).astype(int)
+    else:
+        df["touches"] = 0
 
-    # TV만 사용(가능하면)
-    if "source" in df.columns:
-        df = df[df["source"].astype(str).str.upper().str.contains("TV") | df["source"].isna()].reset_index(drop=True)
+    # 거리 필터 (있을 때만)
+    if args.dist_max is not None and "distance_pct" in df.columns:
+        df = df[(pd.to_numeric(df["distance_pct"], errors="coerce") <= float(args.dist_max))]
+        df = df.reset_index(drop=True)
 
-    # distance_pct 필터 (열이 있을 때만 적용)
-    if "distance_pct" in df.columns:
-        df["distance_pct"] = pd.to_numeric(df["distance_pct"], errors="coerce")
-        before = len(df)
-        df = df[df["distance_pct"].abs() <= args.dist_max].reset_index(drop=True)
-        print(f"[BT] distance_pct ≤ {args.dist_max:.4f}% 필터: {before} → {len(df)} rows")
+    # (선택) level_estimate 컬럼 없으면 None으로 추가
+    if "level_estimate" not in df.columns:
+        df["level_estimate"] = np.nan
 
-    # 이벤트 그룹별로 분리
-    rows_by_group: Dict[str, pd.DataFrame] = {}
-    for g, names in EVENT_GROUPS.items():
-        rows_by_group[g] = df[df["event"].isin(names)].copy()
-
+    # 심볼/이벤트 분포
     syms = sorted(df["symbol"].unique().tolist())
     print(f"[BT] signals rows={len(df)}, symbols={len(syms)}, timeframe={args.timeframe}")
 
+    # 이벤트 그룹들
+    groups = [
+        ("detected",     df[df["event"].str.contains("level")]),    # level2_detected, level3_detected 등
+        ("price_in_box", df[df["event"]=="price_in_box"]),
+        ("box_breakout", df[df["event"]=="box_breakout"]),
+        ("line_breakout",df[df["event"]=="line_breakout"]),
+    ]
+
     all_trades = []
-    all_stats = []
-    os.makedirs("./logs", exist_ok=True)
-
-    for grp in ("detected","price_in_box","box_breakout","line_breakout"):
-        dfg = rows_by_group.get(grp, pd.DataFrame())
+    all_stats  = []
+    expiries_h = parse_expiries(args.expiries)
+    for name, dfg in groups:
         if dfg.empty:
-            print(f"[BT][{grp}] no rows, skip.")
             continue
-        tr, st = run_group(dfg, grp, args.timeframe, tp_pct, sl_pct, args.fee, expiries_h, args.procs)
-        # 저장
-        tpath = f"./logs/bt_tv_events_trades_{grp}.csv"
-        spath = f"./logs/bt_tv_events_stats_{grp}.csv"
-        tr.to_csv(tpath, index=False)
-        st.insert(0, "group", grp)
-        st.to_csv(spath, index=False)
-        print(f"[BT][{grp}] trades -> {tpath} (rows={len(tr)})")
-        print(f"[BT][{grp}] stats  -> {spath} (rows={len(st)})")
+        tr, st = run_group(dfg, name, args.timeframe, args.tp, args.sl, args.fee, expiries_h, args.procs)
+        if not tr.empty:
+            tr = tr.copy()
+            tr["group"] = name
+            all_trades.append(tr)
+        if not st.empty:
+            st = st.copy()
+            st["group"] = name
+            all_stats.append(st)
 
-        all_trades.append(tr.assign(group=grp))
-        all_stats.append(st)
-
-    # 요약
     trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-    stats = pd.concat(all_stats, ignore_index=True) if all_stats else pd.DataFrame()
+    stats  = pd.concat(all_stats,  ignore_index=True) if all_stats  else pd.DataFrame()
 
+    # 요약 출력
     if not stats.empty:
-        stats = stats[["group","expiry_h","trades","win_rate","avg_net","median_net","total_net"]].copy()
+        # 그룹+만기별 요약
+        cols = ["group","expiry_h","trades","win_rate","avg_net","median_net","total_net"]
+        stats = stats[["group","expiry_h","trades","win_rate","avg_net","median_net","total_net"]]
         print("\n=== Summary (by event group & expiry) ===")
-        print(stats.to_string(index=False))
+        print(stats.sort_values(["group","expiry_h"])[cols].to_string(index=False))
 
-    trades.to_csv("./logs/bt_tv_events_trades.csv", index=False)
-    stats.to_csv("./logs/bt_tv_events_stats.csv", index=False)
-    print(f"\n[BT] saved -> ./logs/bt_tv_events_trades.csv (rows={len(trades)})")
-    print(f"[BT] saved -> ./logs/bt_tv_events_stats.csv (rows={len(stats)})")
+    # 저장
+    os.makedirs("./logs", exist_ok=True)
+    path_tr = "./logs/bt_tv_events_trades.csv"
+    path_st = "./logs/bt_tv_events_stats.csv"
+    trades.to_csv(path_tr, index=False, encoding="utf-8")
+    stats.to_csv(path_st, index=False, encoding="utf-8")
+    print(f"\n[BT] saved -> {path_tr} (rows={len(trades)})")
+    print(f"[BT] saved -> {path_st} (rows={len(stats)})")
 
 if __name__ == "__main__":
     main()
