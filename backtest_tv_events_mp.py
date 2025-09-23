@@ -11,10 +11,10 @@ backtest_tv_events_mp.py  (TV 알람 4종 멀티프로세싱 안정판)
 - 그룹 통계: groupby.agg 로 FutureWarning 회피
 
 사용 예)
-  python backtest_tv_events_mp.py .\logs\signals_tv.csv ^
-    --timeframe 15m ^
-    --expiries 4h,8h ^
-    --tp 1.5 --sl 1.25 --fee 0.001 ^
+  python backtest_tv_events_mp.py ./logs/signals_tv.csv `
+    --timeframe 15m `
+    --expiries 4h,8h `
+    --tp 1.5 --sl 1.25 --fee 0.001 `
     --procs 24
 
 출력:
