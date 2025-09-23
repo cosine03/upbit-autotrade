@@ -103,16 +103,66 @@ def minutes_of(tf: str) -> int:
 
 # -------------- OHLCV CACHE --------------
 
+# --- replace this function in backtest_tv_events_mp.py ---
+
+from pandas.api.types import is_datetime64_any_dtype
+
 @lru_cache(maxsize=256)
 def load_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
     df = get_ohlcv(symbol, timeframe)
     if df is None or len(df) == 0:
+        print(f"[{symbol}] get_ohlcv returned empty.")
         return pd.DataFrame()
-    df = df.reset_index(drop=False)
-    df = to_utc_ts_col(df)
-    # 필요한 컬럼만
-    keep = [c for c in ("ts","open","high","low","close") if c in df.columns]
-    return df[keep].dropna(subset=["ts", "open", "high", "low", "close"]).reset_index(drop=True)
+
+    # 1) DatetimeIndex를 바로 ts로 사용 (가장 안전)
+    if isinstance(df.index, pd.DatetimeIndex):
+        ts = df.index
+        ts = ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
+        df2 = df.copy()
+        df2["ts"] = ts
+        df2 = df2.reset_index(drop=True)
+    else:
+        # 2) reset_index 후, datetime형 컬럼을 찾아 'ts'로 표준화
+        df2 = df.reset_index(drop=False)
+
+        ts_col = None
+        # 2-a) 이미 datetime dtype인 컬럼이 있으면 우선 채택
+        for c in df2.columns:
+            if is_datetime64_any_dtype(df2[c]):
+                ts_col = c
+                break
+
+        # 2-b) 없다면 후보 이름을 파싱해서 생성
+        if ts_col is None:
+            for cand in ("ts", "index", "timestamp", "time", "datetime", "date"):
+                if cand in df2.columns:
+                    parsed = pd.to_datetime(df2[cand], utc=True, errors="coerce")
+                    if parsed.notna().any():
+                        df2["ts"] = parsed
+                        ts_col = "ts"
+                        break
+
+        # 2-c) 그래도 못 찾으면 포기(스킵)
+        if ts_col is None and "ts" not in df2.columns:
+            print(f"[{symbol}] OHLCV missing datetime column; skipping.")
+            return pd.DataFrame()
+
+        if "ts" not in df2.columns:
+            # datetime dtype 컬럼명을 ts로 바꾸고 UTC 정규화
+            df2 = df2.rename(columns={ts_col: "ts"})
+            df2["ts"] = pd.to_datetime(df2["ts"], utc=True, errors="coerce")
+
+    # 3) 필요한 컬럼만 남기고 정렬/정리
+    keep = [c for c in ("ts", "open", "high", "low", "close") if c in df2.columns]
+    if "ts" not in keep:
+        print(f"[{symbol}] OHLCV still has no ts after normalization; skipping.")
+        return pd.DataFrame()
+
+    df2 = (df2[keep]
+           .dropna(subset=["ts", "open", "high", "low", "close"])
+           .sort_values("ts")
+           .reset_index(drop=True))
+    return df2
 
 # -------------- ENTRY/EXIT LOGIC --------------
 
