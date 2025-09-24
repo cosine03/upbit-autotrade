@@ -97,7 +97,6 @@ def parse_side(row: pd.Series) -> Optional[str]:
         return "support"
     return None
 
-
 # -------------------- 시뮬 엔진 (로컬 간단 버전) --------------------
 # 가정:
 # - 입력 CSV(signals_tv_enriched.csv)에 ts, symbol, event, side, distance_pct, est_level, sig_price 가 있음
@@ -161,7 +160,6 @@ def _simulate_one_trade(ohlcv: pd.DataFrame, ts_sig: pd.Timestamp, tp_pct: float
         # SL 선도달
         ret = (sl_price - entry) / entry - round_fee
         return float(ret)
-
 
 def simulate_symbol(symbol: str,
                     df_sym: pd.DataFrame,
