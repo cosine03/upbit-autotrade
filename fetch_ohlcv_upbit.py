@@ -1,149 +1,185 @@
 # -*- coding: utf-8 -*-
 """
-fetch_ohlcv_upbit.py
-- Upbit에서 심볼별 OHLCV 캔들(기본: 15m)을 받아 ./data/ohlcv/{symbol}-{timeframe}.csv 로 저장/갱신합니다.
-- 기존 파일이 있으면 병합(중복 제거) 후 최신 상태로 유지합니다.
+fetch_ohlcv_upbit.py (paginated)
+- Upbit OHLCV를 since~now 까지 페이징으로 반복 요청해서 충분한 캔들을 확보합니다.
+- 기존 파일이 있을 경우 병합(중복 제거, 시간 정렬) 후 저장합니다.
 
-필요: pip install ccxt
-예)
-  python fetch_ohlcv_upbit.py --symbols KRW-BTC,KRW-ETH,KRW-XRP \
-      --timeframe 15m --since-days 30 --limit 2000 --outdir ./data/ohlcv
+사용 예:
+  python fetch_ohlcv_upbit.py --symbols-file .\symbols.txt --timeframe 15m --since-days 180 \
+    --max-bars 20000 --outdir .\data\ohlcv
 
-  python fetch_ohlcv_upbit.py --symbols-file symbols.txt --timeframe 15m
+출력 파일명:
+  {OUTDIR}/{SYMBOL}-{TIMEFRAME}.csv  (예: .\data\ohlcv\KRW-BTC-15m.csv)
+
+CSV 컬럼:
+  ts, open, high, low, close, volume  (ts는 UTC ISO8601)
 """
 
 import os
-import sys
 import time
 import argparse
 from typing import List, Optional
-
+import math
 import ccxt
 import pandas as pd
 
-# -------- utils --------
+# ------------ helpers ------------
 
-def ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
+TF_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "10m": 600_000, "15m": 900_000,
+    "30m": 1_800_000, "60m": 3_600_000, "1h": 3_600_000, "2h": 7_200_000,
+    "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
+    "1d": 86_400_000, "1w": 604_800_000
+}
 
-def to_utc_ts(s):
-    return pd.to_datetime(s, utc=True, errors="coerce")
+def tf_to_ms(tf: str) -> int:
+    s = tf.strip().lower()
+    if s in TF_MS:
+        return TF_MS[s]
+    if s.endswith("m"):
+        return int(s[:-1]) * 60_000
+    if s.endswith("h"):
+        return int(s[:-1]) * 3_600_000
+    if s.endswith("d"):
+        return int(s[:-1]) * 86_400_000
+    raise ValueError(f"unsupported timeframe: {tf}")
+
+def save_csv(path: str, df: pd.DataFrame):
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    df.to_csv(path, index=False)
 
 def load_existing(path: str) -> Optional[pd.DataFrame]:
-    if not os.path.exists(path):
-        return None
-    try:
-        df = pd.read_csv(path)
-        # 표준 컬럼 보장
-        if "ts" in df.columns:
-            df["ts"] = to_utc_ts(df["ts"])
-        else:
-            # 과거 포맷 대응: index가 ts였거나 날짜컬럼이 있을 수 있음
-            for cand in ("timestamp","date","time"):
-                if cand in df.columns:
-                    df["ts"] = to_utc_ts(df[cand])
-                    break
-            if "ts" not in df.columns:
-                return None
-        keep = ["ts","open","high","low","close","volume"]
-        for k in keep:
-            if k not in df.columns:
-                df[k] = pd.NA
-        df = df[keep].dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
-        return df
-    except Exception:
-        return None
+    if os.path.exists(path):
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return None
+    return None
 
-def unify_frame_name(tf: str) -> str:
-    return tf.strip().lower()
-
-def timeframe_to_ccxt(tf: str) -> str:
-    # ccxt 표준 그대로 사용 (m/h/d)
-    return unify_frame_name(tf)
-
-def fetch_ohlcv(exchange, symbol: str, timeframe: str, since_ms: Optional[int], limit: int) -> pd.DataFrame:
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
-    # ccxt: [ms, open, high, low, close, volume]
-    if not ohlcv:
-        return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
-    df = pd.DataFrame(ohlcv, columns=["ms","open","high","low","close","volume"])
-    df["ts"] = pd.to_datetime(df["ms"], unit="ms", utc=True)
-    df = df[["ts","open","high","low","close","volume"]]
-    return df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
-
-def merge_dedup(old_df: Optional[pd.DataFrame], new_df: pd.DataFrame) -> pd.DataFrame:
-    if old_df is None or old_df.empty:
-        base = new_df.copy()
+def merge_ohlcv(old_df: Optional[pd.DataFrame], new_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["ts","open","high","low","close","volume"]
+    if old_df is not None and set(cols).issubset(old_df.columns):
+        merged = pd.concat([old_df[cols], new_df[cols]], ignore_index=True)
     else:
-        base = pd.concat([old_df, new_df], ignore_index=True)
-    base = base.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
-    # 타입 정리
-    for col in ["open","high","low","close","volume"]:
-        base[col] = pd.to_numeric(base[col], errors="coerce")
-    return base.dropna(subset=["ts","open","high","low","close"]).reset_index(drop=True)
+        merged = new_df[cols].copy()
 
-def save_csv(df: pd.DataFrame, path: str):
-    ensure_dir(os.path.dirname(os.path.abspath(path)) or ".")
-    # ISO8601 UTC로 저장
-    out = df.copy()
-    out["ts"] = out["ts"].dt.tz_convert("UTC")
-    out.to_csv(path, index=False)
+    # 중복 제거 + 시간 정렬
+    merged["ts"] = pd.to_datetime(merged["ts"], utc=True, errors="coerce")
+    merged = merged.dropna(subset=["ts"]).drop_duplicates(subset=["ts"]).sort_values("ts")
+    # ISO8601로 저장
+    merged["ts"] = merged["ts"].dt.tz_convert("UTC").dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    return merged.reset_index(drop=True)
 
-# -------- main --------
+# ------------ core fetch ------------
+
+def fetch_symbol_ohlcv_paginated(
+    ex: ccxt.Exchange,
+    symbol: str,
+    timeframe: str,
+    since_days: int,
+    max_bars: int = 20000,
+    batch: int = 200,
+    sleep_sec: float = 0.08,
+    retries: int = 3,
+) -> pd.DataFrame:
+    tfms = tf_to_ms(timeframe)
+    now_ms = ex.milliseconds()
+    since_ms = now_ms - since_days * 86_400_000
+
+    out = []
+    cursor = since_ms
+    total = 0
+
+    while True:
+        if total >= max_bars:
+            break
+
+        got = None
+        for _ in range(retries):
+            try:
+                got = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=batch)
+                break
+            except ccxt.RateLimitExceeded:
+                time.sleep(max(0.2, sleep_sec * 2))
+            except Exception:
+                time.sleep(sleep_sec)
+
+        if not got:
+            break
+
+        # ccxt 표준: [timestamp, open, high, low, close, volume]
+        for t, o, h, l, c, v in got:
+            out.append([t, o, h, l, c, v])
+        total += len(got)
+
+        # 다음 페이지로 전진
+        last_ts = got[-1][0]
+        next_cursor = last_ts + tfms
+        if next_cursor <= cursor:
+            # 안전장치: 타임스탬프가 안 전진하면 중단
+            break
+        cursor = next_cursor
+
+        # 이제(now)보다 충분히 가까우면 종료
+        # (여유 2캔들)
+        if cursor >= now_ms - 2 * tfms:
+            break
+
+        time.sleep(sleep_sec)
+
+    if not out:
+        return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+
+    df = pd.DataFrame(out, columns=["ts_ms","open","high","low","close","volume"])
+    # ts를 UTC ISO로
+    ts = pd.to_datetime(df["ts_ms"], utc=True, unit="ms")
+    df = pd.DataFrame({
+        "ts": ts.dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+        "open": df["open"].astype(float),
+        "high": df["high"].astype(float),
+        "low": df["low"].astype(float),
+        "close": df["close"].astype(float),
+        "volume": df["volume"].astype(float),
+    })
+    return df
+
+# ------------ CLI ------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--symbols", help="콤마구분 심볼들 (예: KRW-BTC,KRW-ETH)")
-    ap.add_argument("--symbols-file", help="심볼 리스트 파일(한 줄에 하나)")
-    ap.add_argument("--timeframe", default="15m", help="기본 15m")
-    ap.add_argument("--since-days", type=int, default=45, help="과거 N일 전부터 가져오기 (기본 45일)")
-    ap.add_argument("--limit", type=int, default=2000, help="ccxt 요청당 캔들 수 (기본 2000)")
-    ap.add_argument("--outdir", default="./data/ohlcv", help="출력 디렉토리")
-    ap.add_argument("--sleep", type=float, default=0.2, help="요청 사이 딜레이(초)")
-
+    ap.add_argument("--symbols-file", required=True, help="라인별 심볼 목록 (예: KRW-BTC)")
+    ap.add_argument("--timeframe", default="15m")
+    ap.add_argument("--since-days", type=int, default=90)
+    ap.add_argument("--max-bars", type=int, default=20000, help="심볼당 최대 캔들 수 상한")
+    ap.add_argument("--batch", type=int, default=200, help="요청당 최대 캔들 (Upbit 일반적으로 200)")
+    ap.add_argument("--sleep", type=float, default=0.08, help="요청 사이 대기(초)")
+    ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--outdir", default="./data/ohlcv")
     args = ap.parse_args()
 
-    # 심볼 수집
-    symbols: List[str] = []
-    if args.symbols:
-        symbols += [s.strip() for s in args.symbols.split(",") if s.strip()]
-    if args.symbols_file and os.path.exists(args.symbols_file):
-        with open(args.symbols_file, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if s and not s.startswith("#"):
-                    symbols.append(s)
-    symbols = sorted(set(symbols))
-    if not symbols:
-        print("[FETCH] no symbols provided. use --symbols or --symbols-file")
-        sys.exit(2)
+    with open(args.symbols_file, "r", encoding="utf-8") as f:
+        symbols = [ln.strip() for ln in f if ln.strip()]
 
-    tf = timeframe_to_ccxt(args.timeframe)
-    ensure_dir(args.outdir)
-
-    ex = ccxt.upbit()
-    # Upbit는 무인증 퍼블릭 OHLCV OK
-
-    # since 계산
-    now_ms = int(time.time() * 1000)
-    since_ms = now_ms - int(args.since_days * 24 * 60 * 60 * 1000)
-
-    print(f"[FETCH] start: symbols={len(symbols)}, timeframe={tf}, since_days={args.since_days}, outdir={args.outdir}")
+    ex = ccxt.upbit({"enableRateLimit": True})
+    print(f"[FETCH] start: symbols={len(symbols)}, timeframe={args.timeframe}, since_days={args.since_days}, outdir={args.outdir}")
 
     for sym in symbols:
-        out_path = os.path.join(args.outdir, f"{sym}-{tf}.csv")
+        path = os.path.join(args.outdir, f"{sym}-{args.timeframe}.csv")
         try:
-            old = load_existing(out_path)
-            new = fetch_ohlcv(ex, sym, tf, since_ms, args.limit)
-            if new is None or new.empty:
-                print(f"[{sym}] empty fetch.")
-                continue
-            merged = merge_dedup(old, new)
-            save_csv(merged, out_path)
-            print(f"[{sym}] saved -> {out_path} (rows={len(merged)})")
+            new_df = fetch_symbol_ohlcv_paginated(
+                ex, sym, args.timeframe,
+                since_days=args.since_days,
+                max_bars=args.max_bars,
+                batch=args.batch,
+                sleep_sec=args.sleep,
+                retries=args.retries,
+            )
+            old_df = load_existing(path)
+            merged = merge_ohlcv(old_df, new_df)
+            save_csv(path, merged)
+            print(f"[{sym}] saved -> {path} (rows={len(merged)})")
         except Exception as e:
             print(f"[{sym}] ERROR: {e}")
-        time.sleep(args.sleep)
 
     print("[FETCH] done.")
 
