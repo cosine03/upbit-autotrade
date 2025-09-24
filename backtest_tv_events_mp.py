@@ -119,9 +119,6 @@ def parse_side(row: pd.Series) -> Optional[str]:
     return None
 
 # -------------------- 시뮬 엔진 (로컬 간단 버전) --------------------
-# 가정:
-# - 입력 CSV(signals_tv_enriched.csv)에 ts, symbol, event, side, distance_pct, est_level, sig_price 가 있음
-# - 각 신호(ts) 직후부터 expiry_h 시간 내 TP/SL 체크 (간단화: 고/저가 스캔), 수수료 반영
 def _simulate_one_trade(ohlcv: pd.DataFrame, ts_sig: pd.Timestamp, tp_pct: float, sl_pct: float, fee: float, expiry_h: float, side: str) -> Optional[float]:
     ts = pd.to_datetime(ohlcv["ts"], utc=True, errors="coerce")
     ts_idx = pd.DatetimeIndex(ts)
@@ -139,7 +136,6 @@ def _simulate_one_trade(ohlcv: pd.DataFrame, ts_sig: pd.Timestamp, tp_pct: float
     if look.empty:
         return None
 
-    # 여기서는 방향 동일 가정(추세 추종 롱)
     tp_price = entry * (1 + tp_pct / 100.0)
     sl_price = entry * (1 - sl_pct / 100.0)
 
@@ -265,11 +261,22 @@ def main():
     if "event" not in df.columns:
         df["event"] = "detected"
 
-    # 거리 필터 (distance_pct가 퍼센트 값이면 dist-max*100 비교)
+    # 거리 필터: distance_pct 단위 자동 감지 (ratio vs percent)
     if "distance_pct" in df.columns and pd.api.types.is_numeric_dtype(df["distance_pct"]):
         before = len(df)
-        df = df[df["distance_pct"] <= (args.dist_max * 100.0)].copy()
-        print(f"[BT] distance_pct filter {args.dist_max}: {before}->{len(df)} rows")
+        dp = pd.to_numeric(df["distance_pct"], errors="coerce")
+        mx = float(dp.max()) if len(dp) else float("nan")
+        if pd.isna(mx):
+            thr = args.dist_max
+            scale = "unknown->ratio"
+        elif mx <= 1.0:        # 0.002 = 0.2% 같은 비율 스케일
+            thr = args.dist_max
+            scale = "ratio"
+        else:                  # 2.0 = 2% 같은 퍼센트 스케일
+            thr = args.dist_max * 100.0
+            scale = "percent"
+        df = df[dp <= thr].copy()
+        print(f"[BT] distance_pct filter ({scale}) thr={thr:.6g}: {before}->{len(df)} rows")
 
     if df.empty:
         print("[BT] signals empty after filter.")
