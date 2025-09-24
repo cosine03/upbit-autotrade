@@ -1,185 +1,171 @@
 # -*- coding: utf-8 -*-
 """
-fetch_ohlcv_upbit.py (paginated)
-- Upbit OHLCV를 since~now 까지 페이징으로 반복 요청해서 충분한 캔들을 확보합니다.
-- 기존 파일이 있을 경우 병합(중복 제거, 시간 정렬) 후 저장합니다.
+Upbit OHLCV fetcher with pagination & incremental merge.
 
-사용 예:
-  python fetch_ohlcv_upbit.py --symbols-file .\symbols.txt --timeframe 15m --since-days 180 \
-    --max-bars 20000 --outdir .\data\ohlcv
-
-출력 파일명:
-  {OUTDIR}/{SYMBOL}-{TIMEFRAME}.csv  (예: .\data\ohlcv\KRW-BTC-15m.csv)
-
-CSV 컬럼:
-  ts, open, high, low, close, volume  (ts는 UTC ISO8601)
+사용 예 (PowerShell):
+  python fetch_ohlcv_upbit.py `
+    --symbols-file .\symbols.txt `
+    --timeframe 15m `
+    --since-days 180 `
+    --max-bars 20000 `
+    --throttle 0.2 `
+    --retries 3 `
+    --outdir .\data\ohlcv
 """
 
 import os
 import time
-import argparse
-from typing import List, Optional
 import math
-import ccxt
+import argparse
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 
-# ------------ helpers ------------
+try:
+    import ccxt
+except ImportError:
+    raise SystemExit("ccxt가 필요합니다: pip install ccxt")
 
 TF_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "10m": 600_000, "15m": 900_000,
-    "30m": 1_800_000, "60m": 3_600_000, "1h": 3_600_000, "2h": 7_200_000,
-    "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
-    "1d": 86_400_000, "1w": 604_800_000
+    "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
 }
 
-def tf_to_ms(tf: str) -> int:
-    s = tf.strip().lower()
-    if s in TF_MS:
-        return TF_MS[s]
-    if s.endswith("m"):
-        return int(s[:-1]) * 60_000
-    if s.endswith("h"):
-        return int(s[:-1]) * 3_600_000
-    if s.endswith("d"):
-        return int(s[:-1]) * 86_400_000
-    raise ValueError(f"unsupported timeframe: {tf}")
+COLS = ["ts", "open", "high", "low", "close", "volume"]
 
-def save_csv(path: str, df: pd.DataFrame):
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    df.to_csv(path, index=False)
+def load_symbols(path: str) -> list[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        syms = [ln.strip() for ln in f if ln.strip()]
+    return syms
 
-def load_existing(path: str) -> Optional[pd.DataFrame]:
-    if os.path.exists(path):
-        try:
-            return pd.read_csv(path)
-        except Exception:
-            return None
-    return None
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
 
-def merge_ohlcv(old_df: Optional[pd.DataFrame], new_df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["ts","open","high","low","close","volume"]
-    if old_df is not None and set(cols).issubset(old_df.columns):
-        merged = pd.concat([old_df[cols], new_df[cols]], ignore_index=True)
-    else:
-        merged = new_df[cols].copy()
+def read_existing_csv(path: str) -> pd.DataFrame | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+        # 열 보정
+        if "timestamp" in df.columns and "ts" not in df.columns:
+            df.rename(columns={"timestamp": "ts"}, inplace=True)
+        for c in COLS:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[COLS].copy()
+        # 타입/정렬 보정
+        df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+        df = df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+        return df
+    except Exception:
+        return None
 
-    # 중복 제거 + 시간 정렬
-    merged["ts"] = pd.to_datetime(merged["ts"], utc=True, errors="coerce")
-    merged = merged.dropna(subset=["ts"]).drop_duplicates(subset=["ts"]).sort_values("ts")
-    # ISO8601로 저장
-    merged["ts"] = merged["ts"].dt.tz_convert("UTC").dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    return merged.reset_index(drop=True)
+def fetch_paged(exchange, symbol: str, timeframe: str, since_ms: int, max_bars: int,
+                throttle: float, retries: int) -> list[list]:
+    bars: list[list] = []
+    tf_ms = TF_MS[timeframe]
+    # ccxt 업빗은 보통 200개 제한
+    limit_per_call = 200
 
-# ------------ core fetch ------------
-
-def fetch_symbol_ohlcv_paginated(
-    ex: ccxt.Exchange,
-    symbol: str,
-    timeframe: str,
-    since_days: int,
-    max_bars: int = 20000,
-    batch: int = 200,
-    sleep_sec: float = 0.08,
-    retries: int = 3,
-) -> pd.DataFrame:
-    tfms = tf_to_ms(timeframe)
-    now_ms = ex.milliseconds()
-    since_ms = now_ms - since_days * 86_400_000
-
-    out = []
-    cursor = since_ms
-    total = 0
-
-    while True:
-        if total >= max_bars:
-            break
-
-        got = None
-        for _ in range(retries):
+    while len(bars) < max_bars:
+        last_try_exc = None
+        for _ in range(max(1, retries)):
             try:
-                got = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=batch)
+                batch = exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit_per_call)
                 break
-            except ccxt.RateLimitExceeded:
-                time.sleep(max(0.2, sleep_sec * 2))
-            except Exception:
-                time.sleep(sleep_sec)
-
-        if not got:
+            except Exception as e:
+                last_try_exc = e
+                time.sleep(max(0.2, throttle))
+        else:
+            # retries 모두 실패
+            if last_try_exc:
+                print(f"[{symbol}] fetch failed after retries: {last_try_exc}")
             break
 
-        # ccxt 표준: [timestamp, open, high, low, close, volume]
-        for t, o, h, l, c, v in got:
-            out.append([t, o, h, l, c, v])
-        total += len(got)
-
-        # 다음 페이지로 전진
-        last_ts = got[-1][0]
-        next_cursor = last_ts + tfms
-        if next_cursor <= cursor:
-            # 안전장치: 타임스탬프가 안 전진하면 중단
-            break
-        cursor = next_cursor
-
-        # 이제(now)보다 충분히 가까우면 종료
-        # (여유 2캔들)
-        if cursor >= now_ms - 2 * tfms:
+        if not batch:
+            # 더 받을 것이 없음
             break
 
-        time.sleep(sleep_sec)
+        # 중복 캔들 제거
+        if bars and batch and batch[0][0] == bars[-1][0]:
+            batch = batch[1:]
 
-    if not out:
-        return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+        bars.extend(batch)
 
-    df = pd.DataFrame(out, columns=["ts_ms","open","high","low","close","volume"])
-    # ts를 UTC ISO로
-    ts = pd.to_datetime(df["ts_ms"], utc=True, unit="ms")
-    df = pd.DataFrame({
-        "ts": ts.dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-        "open": df["open"].astype(float),
-        "high": df["high"].astype(float),
-        "low": df["low"].astype(float),
-        "close": df["close"].astype(float),
-        "volume": df["volume"].astype(float),
-    })
-    return df
+        # 다음 페이지
+        since_ms = batch[-1][0] + tf_ms
 
-# ------------ CLI ------------
+        # 레이트리밋 보호
+        time.sleep(throttle)
+
+    # 필요 시 뒤에서 max_bars만 유지
+    if len(bars) > max_bars:
+        bars = bars[-max_bars:]
+
+    return bars
+
+def make_df(bars: list[list]) -> pd.DataFrame:
+    if not bars:
+        return pd.DataFrame(columns=COLS)
+    df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    return df[COLS].copy()
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--symbols-file", required=True, help="라인별 심볼 목록 (예: KRW-BTC)")
+    ap.add_argument("--symbols-file", required=True, help="심볼 리스트 텍스트 파일 (한 줄에 하나)")
     ap.add_argument("--timeframe", default="15m")
-    ap.add_argument("--since-days", type=int, default=90)
-    ap.add_argument("--max-bars", type=int, default=20000, help="심볼당 최대 캔들 수 상한")
-    ap.add_argument("--batch", type=int, default=200, help="요청당 최대 캔들 (Upbit 일반적으로 200)")
-    ap.add_argument("--sleep", type=float, default=0.08, help="요청 사이 대기(초)")
-    ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--since-days", type=int, default=90, help="현재 시각 기준 과거 N일")
+    ap.add_argument("--max-bars", type=int, default=2000, help="심볼당 최대 바 수")
+    ap.add_argument("--throttle", type=float, default=0.2, help="호출 간 대기(초)")
+    ap.add_argument("--retries", type=int, default=3, help="실패 시 재시도 횟수")
     ap.add_argument("--outdir", default="./data/ohlcv")
     args = ap.parse_args()
 
-    with open(args.symbols_file, "r", encoding="utf-8") as f:
-        symbols = [ln.strip() for ln in f if ln.strip()]
+    symbols = load_symbols(args.symbols_file)
+    ensure_dir(args.outdir)
 
-    ex = ccxt.upbit({"enableRateLimit": True})
+    # ccxt exchange
+    exchange = ccxt.upbit({"enableRateLimit": True})
+
+    # since 계산
+    since_dt = datetime.now(timezone.utc) - timedelta(days=args.since_days)
+    since_ms = int(since_dt.timestamp() * 1000)
+
     print(f"[FETCH] start: symbols={len(symbols)}, timeframe={args.timeframe}, since_days={args.since_days}, outdir={args.outdir}")
 
+    tf_ms = TF_MS.get(args.timeframe)
+    if tf_ms is None:
+        raise SystemExit(f"지원하지 않는 timeframe: {args.timeframe}")
+
     for sym in symbols:
-        path = os.path.join(args.outdir, f"{sym}-{args.timeframe}.csv")
-        try:
-            new_df = fetch_symbol_ohlcv_paginated(
-                ex, sym, args.timeframe,
-                since_days=args.since_days,
-                max_bars=args.max_bars,
-                batch=args.batch,
-                sleep_sec=args.sleep,
-                retries=args.retries,
-            )
-            old_df = load_existing(path)
-            merged = merge_ohlcv(old_df, new_df)
-            save_csv(path, merged)
-            print(f"[{sym}] saved -> {path} (rows={len(merged)})")
-        except Exception as e:
-            print(f"[{sym}] ERROR: {e}")
+        out_path = os.path.join(args.outdir, f"{sym}-{args.timeframe}.csv")
+        old_df = read_existing_csv(out_path)
+
+        # 증분 시작점: 기존 마지막 ts 이후부터
+        start_ms = since_ms
+        if old_df is not None and not old_df.empty:
+            last_ts = int(old_df["ts"].iloc[-1].value // 1_000_000)  # ns→ms
+            start_ms = max(start_ms, last_ts + tf_ms)
+
+        bars = fetch_paged(exchange, sym, args.timeframe, start_ms, args.max_bars, args.throttle, args.retries)
+        new_df = make_df(bars)
+
+        if old_df is None or old_df.empty:
+            merged = new_df
+        else:
+            if new_df.empty:
+                merged = old_df
+            else:
+                # 경고 회피: 빈 DF concat 피하고, 필요한 열만 보장
+                merged = pd.concat([old_df[COLS], new_df[COLS]], ignore_index=True)
+                # ts 기준 중복 제거 및 정렬
+                merged = merged.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+
+        # 저장
+        ensure_dir(os.path.dirname(out_path))
+        merged.to_csv(out_path, index=False)
+        print(f"[{sym}] saved -> {out_path} (rows={len(merged)})")
 
     print("[FETCH] done.")
 
