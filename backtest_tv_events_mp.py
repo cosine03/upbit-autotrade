@@ -204,8 +204,6 @@ try:
 except TypeError:
     # 구판다스/혼합환경 안전 경로
     summary = summarize_trades(trades, by=("event", "expiry_h"))
-return trades_df, sdf
-
 
 # -------------------- 메인 --------------------
 
