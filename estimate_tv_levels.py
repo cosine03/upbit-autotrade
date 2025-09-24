@@ -119,6 +119,10 @@ def main():
     ap.add_argument("signals")
     ap.add_argument("--timeframe", default="15m")
     ap.add_argument("--out", default="./logs/signals_tv_enriched.csv")
+    ap.add_argument("--http-timeout", type=float, default=8.0)
+    ap.add_argument("--retries", type=int, default=4)
+    ap.add_argument("--throttle", type=float, default=0.10)
+    ap.add_argument("--dist-max", type=float, default=None, help="e.g., 0.02 for 0.02%")
     args = ap.parse_args()
     enrich(args.signals, args.timeframe, args.out)
 
