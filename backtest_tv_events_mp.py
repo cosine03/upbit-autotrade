@@ -14,25 +14,47 @@ python -u backtest_tv_events_mp.py .\logs\signals_tv_enriched.csv `
   --assume-ohlcv-tz UTC `
   --outdir .\logs\bt_tv_dm0020_tp1p5_sl0p8
 """
-
 import os
 import re
 import argparse
-import time
 from typing import List, Tuple, Optional
 from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import pandas as pd
 
-from utils.agg import summarize_trades  # [PATCH] pandas-safe groupby aggregator
+# -------------------- pandas-safe aggregator (no include_groups) --------------------
+def summarize_trades(df: pd.DataFrame, by=("event", "expiry_h")) -> pd.DataFrame:
+    """
+    판다스 버전과 무관하게 작동하는 집계 유틸.
+    - trades: size()로 계산
+    - avg_net, median_net, total_net: 표준 통계
+    - win_rate: (net > 0) 비율
+    """
+    if df is None or len(df) == 0:
+        cols = [*by, "trades", "avg_net", "median_net", "total_net", "win_rate"]
+        return pd.DataFrame(columns=cols)
+
+    g = df.groupby(list(by), dropna=False)
+    trades_ct = g.size().reset_index(name="trades")
+    stats = (
+        g["net"]
+        .agg(["mean", "median", "sum"])
+        .reset_index()
+        .rename(columns={"mean": "avg_net", "median": "median_net", "sum": "total_net"})
+    )
+    win_rate = g["net"].apply(lambda s: (s > 0).mean()).reset_index(name="win_rate")
+
+    out = trades_ct.merge(stats, on=list(by), how="left").merge(win_rate, on=list(by), how="left")
+    return out.fillna(
+        {"trades": 0, "avg_net": 0.0, "median_net": 0.0, "total_net": 0.0, "win_rate": 0.0}
+    )
 
 # -------------------- 로컬 OHLCV 로딩 --------------------
-
 def _ensure_ts_utc(df: pd.DataFrame, assume_tz: str = "UTC") -> pd.DataFrame:
     out = df.copy()
     if "ts" in out.columns:
-        ts = pd.to_datetime(out["ts"], errors="coerce")
+        ts = pd.to_datetime(out["ts"], errors="coerce", utc=False)
         if ts.dt.tz is None:
             ts = ts.dt.tz_localize(assume_tz).dt.tz_convert("UTC")
         else:
@@ -60,7 +82,8 @@ def _load_csv(path: str, assume_tz: str) -> Optional[pd.DataFrame]:
             return None
         df = _ensure_ts_utc(df, assume_tz=assume_tz)
         keep = ["ts", "open", "high", "low", "close"] + (["volume"] if "volume" in df.columns else [])
-        return df[keep].dropna(subset=["ts", "open", "high", "low", "close"]).reset_index(drop=True)
+        df = df[keep].dropna(subset=["ts", "open", "high", "low", "close"]).reset_index(drop=True)
+        return df
     except Exception:
         return None
 
@@ -78,9 +101,7 @@ def get_ohlcv_csv(symbol: str, timeframe: str, roots: List[str], patterns: List[
                 return df
     return None
 
-
 # -------------------- 유틸 --------------------
-
 def to_utc_ts(x) -> pd.Timestamp:
     if isinstance(x, pd.Timestamp):
         return x.tz_convert("UTC") if x.tzinfo else x.tz_localize("UTC")
@@ -101,37 +122,29 @@ def parse_side(row: pd.Series) -> Optional[str]:
 # 가정:
 # - 입력 CSV(signals_tv_enriched.csv)에 ts, symbol, event, side, distance_pct, est_level, sig_price 가 있음
 # - 각 신호(ts) 직후부터 expiry_h 시간 내 TP/SL 체크 (간단화: 고/저가 스캔), 수수료 반영
-
 def _simulate_one_trade(ohlcv: pd.DataFrame, ts_sig: pd.Timestamp, tp_pct: float, sl_pct: float, fee: float, expiry_h: float, side: str) -> Optional[float]:
-    # 시그널 봉 인덱스
     ts = pd.to_datetime(ohlcv["ts"], utc=True, errors="coerce")
-    idx = int(np.searchsorted(ts.to_numpy(), np.datetime64(ts_sig), side="right") - 1)
+    ts_idx = pd.DatetimeIndex(ts)
+    idx = int(ts_idx.searchsorted(ts_sig, side="right") - 1)
     if idx < 0 or idx >= len(ohlcv):
         return None
 
     entry = float(ohlcv["close"].iloc[idx])
-    # 유효 구간
     end_ts = ts_sig + pd.Timedelta(hours=expiry_h)
-    # 다음 봉부터 스캔
-    look = ohlcv.iloc[idx+1:].copy()
+
+    look = ohlcv.iloc[idx + 1:].copy()
     if look.empty:
         return None
     look = look[look["ts"] <= end_ts]
     if look.empty:
         return None
 
-    # 목표/손절 가격
-    if side == "support":
-        tp_price = entry * (1 + tp_pct/100.0)
-        sl_price = entry * (1 - sl_pct/100.0)
-    else:  # resistance 기준 역방향이 아니라 동일 방향(돌파 추종)이라고 가정
-        tp_price = entry * (1 + tp_pct/100.0)
-        sl_price = entry * (1 - sl_pct/100.0)
+    # 여기서는 방향 동일 가정(추세 추종 롱)
+    tp_price = entry * (1 + tp_pct / 100.0)
+    sl_price = entry * (1 - sl_pct / 100.0)
 
     hit_tp_idx = None
     hit_sl_idx = None
-
-    # 봉 내 고저를 이용해 최초 도달 시점 판정
     highs = look["high"].to_numpy(dtype=float)
     lows  = look["low"].to_numpy(dtype=float)
 
@@ -143,23 +156,16 @@ def _simulate_one_trade(ohlcv: pd.DataFrame, ts_sig: pd.Timestamp, tp_pct: float
             hit_sl_idx = i
             break
 
-    # 수익률(수수료 왕복 2회 가정: 진입/청산)
     round_fee = 2 * fee
 
     if hit_tp_idx is None and hit_sl_idx is None:
-        # 타임아웃: 마지막 종가 청산
         exit_px = float(look["close"].iloc[-1])
-        ret = (exit_px - entry) / entry - round_fee
-        return float(ret)
+        return float((exit_px - entry) / entry - round_fee)
 
     if hit_tp_idx is not None and (hit_sl_idx is None or hit_tp_idx <= hit_sl_idx):
-        # TP 선도달
-        ret = (tp_price - entry) / entry - round_fee
-        return float(ret)
+        return float((tp_price - entry) / entry - round_fee)
     else:
-        # SL 선도달
-        ret = (sl_price - entry) / entry - round_fee
-        return float(ret)
+        return float((sl_price - entry) / entry - round_fee)
 
 def simulate_symbol(symbol: str,
                     df_sym: pd.DataFrame,
@@ -171,7 +177,7 @@ def simulate_symbol(symbol: str,
     if ohlcv is None or ohlcv.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    trades = []
+    rows = []
     for _, r in df_sym.iterrows():
         ts_sig = to_utc_ts(r["ts"])
         side = parse_side(r) or "support"
@@ -180,31 +186,21 @@ def simulate_symbol(symbol: str,
             net = _simulate_one_trade(ohlcv, ts_sig, tp, sl, fee, eh, side)
             if net is None:
                 continue
-            trades.append({
+            rows.append({
                 "symbol": symbol,
                 "event": event,
                 "expiry_h": float(eh),
                 "net": float(net),
             })
-    trades_df = pd.DataFrame(trades)
 
-    # --- 요약 통계 (판다스 하위버전 호환: include_groups 미사용) ---
-# [PATCH] pandas-compat summary (no include_groups)
-try:
-    # 신판다스에서만 되는 경로 (가능하면 사용)
-    summary = trades.groupby(["event", "expiry_h"], include_groups=False)["net"].agg(
-        trades=("net", "count"),
-        win_rate=(lambda s: (s > 0).mean()),
-        avg_net=("net", "mean"),
-        median_net=("net", "median"),
-        total_net=("net", "sum"),
-    ).reset_index()
-except TypeError:
-    # 구판다스/혼합환경 안전 경로
-    summary = summarize_trades(trades, by=("event", "expiry_h"))
+    trades_df = pd.DataFrame(rows)
+    if trades_df.empty:
+        return trades_df, pd.DataFrame(columns=["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"])
 
-# -------------------- 메인 --------------------
+    summary_df = summarize_trades(trades_df, by=("event", "expiry_h"))
+    return trades_df, summary_df
 
+# -------------------- 그룹 실행 --------------------
 def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
               tp: float, sl: float, fee: float, expiries_h: List[float],
               procs: int, roots: List[str], patterns: List[str], assume_tz: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -230,7 +226,6 @@ def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
         with Pool(processes=procs) as pool:
             parts = pool.starmap(simulate_symbol, tasks)
 
-    # 합치기 (빈 경우 안전 처리)
     trades = pd.concat([p[0] for p in parts if p and isinstance(p[0], pd.DataFrame) and not p[0].empty],
                        ignore_index=True) if parts else pd.DataFrame()
     stats  = pd.concat([p[1] for p in parts if p and isinstance(p[1], pd.DataFrame) and not p[1].empty],
@@ -238,17 +233,17 @@ def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
 
     return trades, stats
 
-
+# -------------------- 메인 --------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("signals", help="signals_tv_enriched.csv")
     ap.add_argument("--timeframe", default="15m")
     ap.add_argument("--expiries", default="0.5h,1h,2h")
-    ap.add_argument("--tp", type=float, default=1.5)
-    ap.add_argument("--sl", type=float, default=0.8)
-    ap.add_argument("--fee", type=float, default=0.001)
+    ap.add_argument("--tp", type=float, default=1.5, help="take-profit in percent (1.5 = 1.5%)")
+    ap.add_argument("--sl", type=float, default=0.8, help="stop-loss in percent (0.8 = 0.8%)")
+    ap.add_argument("--fee", type=float, default=0.001, help="per-side fee (0.001 = 0.1%)")
     ap.add_argument("--procs", type=int, default=max(1, cpu_count() // 2))
-    ap.add_argument("--dist-max", type=float, default=0.02)
+    ap.add_argument("--dist-max", type=float, default=0.02, help="max distance ratio (0.02 => 2%)")
     ap.add_argument("--outdir", default="./logs/bt_tv_out")
     # 로컬 CSV
     ap.add_argument("--ohlcv-roots", default=".;./data;./data/ohlcv;./ohlcv;./logs;./logs/ohlcv")
@@ -258,9 +253,7 @@ def main():
 
     print("[BT] BACKTEST TV EVENTS (LOCAL_SIM v3, no external deps)")
 
-    # 입력 로드
     df = pd.read_csv(args.signals)
-    # 표준화
     if "ts" not in df.columns:
         raise ValueError("signals 파일에 'ts'가 필요합니다.")
     df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
@@ -272,7 +265,7 @@ def main():
     if "event" not in df.columns:
         df["event"] = "detected"
 
-    # 거리 필터
+    # 거리 필터 (distance_pct가 퍼센트 값이면 dist-max*100 비교)
     if "distance_pct" in df.columns and pd.api.types.is_numeric_dtype(df["distance_pct"]):
         before = len(df)
         df = df[df["distance_pct"] <= (args.dist_max * 100.0)].copy()
@@ -282,7 +275,6 @@ def main():
         print("[BT] signals empty after filter.")
         return
 
-    # 그룹 매핑
     def _group(e: str) -> str:
         e = (e or "").lower()
         if "price_in_box" in e: return "price_in_box"
@@ -292,10 +284,11 @@ def main():
 
     df["event_group"] = df["event"].astype(str).map(_group)
 
-    # 만료 시간 해석
     expiries_h = []
     for token in str(args.expiries).split(","):
         s = token.strip().lower()
+        if not s:
+            continue
         if s.endswith("h"):
             expiries_h.append(float(s[:-1]))
         elif s.endswith("m"):
@@ -304,18 +297,15 @@ def main():
             expiries_h.append(float(s))
     expiries_h = sorted(set(expiries_h))
 
-    # 출력 디렉토리
     outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
 
-    # roots/patterns
     roots = [x.strip() for x in args.ohlcv_roots.split(";") if x.strip()]
     patterns = [x.strip() for x in args.ohlcv_patterns.split(";") if x.strip()]
     assume_tz = args.assume_ohlcv_tz
 
     print(f"[BT] signals rows={len(df)}, symbols={df['symbol'].nunique()}, timeframe={args.timeframe}")
 
-    # 그룹별 실행
     all_trades = []
     all_stats  = []
     for grp in ["detected", "price_in_box", "box_breakout", "line_breakout"]:
@@ -331,36 +321,26 @@ def main():
     trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
     stats  = pd.concat(all_stats,  ignore_index=True) if all_stats  else pd.DataFrame()
 
-    # 저장
     if not trades.empty:
-        trades.to_csv(os.path.join(outdir, "bt_tv_events_trades.csv"), index=False)
+        trades_path = os.path.join(outdir, "bt_tv_events_trades.csv")
+        trades.to_csv(trades_path, index=False)
+        print(f"[BT] trades saved -> {trades_path}")
     if not stats.empty:
-        stats.to_csv(os.path.join(outdir, "bt_tv_events_stats_raw.csv"), index=False)
+        stats_raw_path = os.path.join(outdir, "bt_tv_events_stats_raw.csv")
+        stats.to_csv(stats_raw_path, index=False)
+        print(f"[BT] stats(raw) saved -> {stats_raw_path}")
 
-    # 요약(그룹/만료)
-    if not stats.empty:
-        # 동일 포맷으로 출력
-        stats = stats[["group", "event", "expiry_h", "trades", "win_rate", "avg_net", "median_net", "total_net"]]
-        # 화면 요약
-    # [PATCH] pandas-compat summary (no include_groups)
-    try:
-    # 신판다스에서만 되는 경로 (가능하면 사용)
-        summary = trades.groupby(["event", "expiry_h"], include_groups=False)["net"].agg(
-            trades=("net", "count"),
-            win_rate=(lambda s: (s > 0).mean()),
-            avg_net=("net", "mean"),
-            median_net=("net", "median"),
-            total_net=("net", "sum"),
-        ).reset_index()
-    except TypeError:
-        # 구판다스/혼합환경 안전 경로
-        summary = summarize_trades(trades, by=("event", "expiry_h"))
-
-        # 보기 좋게 소수점 조정
+    if not trades.empty:
+        gsum = summarize_trades(trades, by=("event", "expiry_h"))
+        gsum = gsum[["event", "expiry_h", "trades", "win_rate", "avg_net", "median_net", "total_net"]]
         pd.options.display.float_format = lambda v: f"{v:,.6f}"
+        print("\n[BT] SUMMARY (by event, expiry_h)")
         print(gsum.to_string(index=False))
+        summary_path = os.path.join(outdir, "bt_tv_events_stats_summary.csv")
+        gsum.to_csv(summary_path, index=False)
+        print(f"[BT] summary saved -> {summary_path}")
 
-        # 별도로 저장
-        gsum.to_csv(os.path.join(outdir, "bt_tv_events_stats_summary.csv"), index=False)
+    print(f"\n[BT] done -> {outdir}")
 
-    print(f"\n[BT] saved -> {outdir}")
+if __name__ == "__main__":
+    main()
