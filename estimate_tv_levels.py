@@ -2,7 +2,7 @@
 """
 estimate_tv_levels.py (Single Process, Full Patched, backward-compatible)
 - TradingView 알람 시점의 레벨을 근사 추정해서 signals_tv.csv를 보강
-- sr_engine.data.get_ohlcv 구버전/신버전 모두 호환:
+- sr_engine.data.get_ohlcv 구/신버전 모두 호환:
   * 신버전: get_ohlcv(symbol, timeframe, roots=..., patterns=..., assume_tz=...)
   * 구버전: get_ohlcv(symbol, timeframe) + 로컬 CSV 로더(roots/patterns) 폴백
 """
@@ -19,6 +19,8 @@ import pandas as pd
 from sr_engine.levels import auto_deviation_band, find_swings
 from sr_engine.data import get_ohlcv as _core_get_ohlcv  # 이름 충돌 방지
 
+VERSION = "ESTIMATOR-SP v1.1 (compat)"
+
 # -------------------- 로컬 CSV 로더 --------------------
 def _load_local_ohlcv(symbol: str, timeframe: str,
                       roots: List[str], patterns: List[str],
@@ -31,51 +33,46 @@ def _load_local_ohlcv(symbol: str, timeframe: str,
             if os.path.exists(path):
                 try:
                     df = pd.read_csv(path)
-                    # ts 컬럼/인덱스 정규화
-                    if "ts" in df.columns:
-                        ts = pd.to_datetime(df["ts"], utc=False, errors="coerce")
-                        # 파일이 assume_tz 기준의 ‘로컬시간’일 수 있으므로 먼저 tz_localize
-                        try:
-                            ts = ts.dt.tz_localize(assume_tz, nonexistent="shift_forward", ambiguous="NaT")
-                        except Exception:
-                            # 이미 tz-aware면 넘어감
-                            if ts.dt.tz is None:
-                                ts = ts.dt.tz_localize("UTC")
-                        ts = ts.dt.tz_convert("UTC")
-                        df.index = ts
-                    else:
-                        # 흔한 컬럼명 케이스 대응
-                        if "time" in df.columns:
-                            ts = pd.to_datetime(df["time"], utc=False, errors="coerce")
-                        elif "datetime" in df.columns:
-                            ts = pd.to_datetime(df["datetime"], utc=False, errors="coerce")
-                        else:
-                            # 첫 컬럼이 시간일 가능성
-                            first_col = df.columns[0]
-                            ts = pd.to_datetime(df[first_col], utc=False, errors="coerce")
-                        try:
-                            ts = ts.dt.tz_localize(assume_tz, nonexistent="shift_forward", ambiguous="NaT")
-                        except Exception:
-                            if ts.dt.tz is None:
-                                ts = ts.dt.tz_localize("UTC")
-                        ts = ts.dt.tz_convert("UTC")
-                        df.index = ts
+                    # ts/시간열 정규화
+                    ts = None
+                    cand_cols = ["ts", "time", "datetime", "date"]
+                    for c in cand_cols:
+                        if c in df.columns:
+                            ts = pd.to_datetime(df[c], utc=False, errors="coerce")
+                            break
+                    if ts is None:
+                        first_col = df.columns[0]
+                        ts = pd.to_datetime(df[first_col], utc=False, errors="coerce")
+
+                    # tz 지정 → UTC 변환
+                    try:
+                        ts = ts.dt.tz_localize(assume_tz, nonexistent="shift_forward", ambiguous="NaT")
+                    except Exception:
+                        if getattr(ts.dt, "tz", None) is None:
+                            ts = ts.dt.tz_localize("UTC")
+                    ts = ts.dt.tz_convert("UTC")
+                    df.index = ts
 
                     # 칼럼 표준화
-                    cols_map = {
-                        "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume",
-                        "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"
-                    }
-                    lower_map = {c: c.lower() for c in df.columns}
-                    df.rename(columns={c: cols_map.get(lower_map[c], lower_map[c]) for c in df.columns}, inplace=True)
+                    lower = {c: c.lower() for c in df.columns}
+                    rename = {}
+                    for c in df.columns:
+                        lc = lower[c]
+                        if lc in {"o", "open"}:       rename[c] = "open"
+                        elif lc in {"h", "high"}:     rename[c] = "high"
+                        elif lc in {"l", "low"}:      rename[c] = "low"
+                        elif lc in {"c", "close"}:    rename[c] = "close"
+                        elif lc in {"v", "volume"}:   rename[c] = "volume"
+                    if rename:
+                        df.rename(columns=rename, inplace=True)
+
                     need = {"open", "high", "low", "close"}
-                    if not need.issubset(set(df.columns)):
+                    if not need.issubset(df.columns):
                         continue
 
-                    # 정렬/결측 제거
                     df = df.sort_index()
-                    df = df[["open", "high", "low", "close"] + ([c for c in ["volume"] if c in df.columns])]
-                    df = df.dropna(subset=["open", "high", "low", "close"])
+                    keep = ["open", "high", "low", "close"] + ([c for c in ["volume"] if c in df.columns])
+                    df = df[keep].dropna(subset=["open", "high", "low", "close"])
                     return df
                 except Exception:
                     continue
@@ -91,7 +88,6 @@ def get_ohlcv_compat(symbol: str, timeframe: str,
         if df is not None and len(df) > 0:
             return df
     except TypeError:
-        # 신버전 시그니처가 아님 → 구버전일 수 있음
         pass
     except Exception:
         pass
@@ -187,7 +183,8 @@ def normalize_swings(swings, n_rows: int) -> Dict[str, np.ndarray]:
 def estimate_level_for_signal(symbol: str, sig_ts: pd.Timestamp, side_hint: Optional[str],
                               timeframe: str, lookback: int = 400, lookahead: int = 40,
                               roots=None, patterns=None, assume_tz="UTC") -> Optional[Dict]:
-    df = get_ohlcv_compat(symbol, timeframe, roots=roots or [], patterns=patterns or [], assume_tz=assume_tz)
+    df = get_ohlcv_compat(symbol, timeframe,
+                          roots=roots or [], patterns=patterns or [], assume_tz=assume_tz)
     if df is None or len(df) == 0:
         print(f"[EST][{symbol}] OHLCV not found")
         return None
@@ -260,6 +257,7 @@ def main():
     ap.add_argument("--ohlcv-patterns", default="{symbol}-{timeframe}.csv;{symbol}_{timeframe}.csv")
     args = ap.parse_args()
 
+    print(f"[{VERSION}]")
     df = pd.read_csv(args.signals)
     if "ts" not in df.columns:
         raise ValueError("signals 파일에 'ts' 컬럼 필요")
