@@ -191,23 +191,20 @@ def simulate_symbol(symbol: str,
     trades_df = pd.DataFrame(trades)
 
     # --- 요약 통계 (판다스 하위버전 호환: include_groups 미사용) ---
-    if trades_df.empty:
-        return trades_df, pd.DataFrame()
-
-    tdf = trades_df.copy()
-    # groupby → agg → reset_index (호환 방식)
-    sdf = (
-        tdf.groupby(["event", "expiry_h"])["net"]
-           .agg(
-               trades="size",
-               win_rate=lambda s: float((s > 0).mean()) if len(s) else 0.0,
-               avg_net="mean",
-               median_net="median",
-               total_net="sum",
-           )
-           .reset_index()
-    )
-    return trades_df, sdf
+# [PATCH] pandas-compat summary (no include_groups)
+try:
+    # 신판다스에서만 되는 경로 (가능하면 사용)
+    summary = trades.groupby(["event", "expiry_h"], include_groups=False)["net"].agg(
+        trades=("net", "count"),
+        win_rate=(lambda s: (s > 0).mean()),
+        avg_net=("net", "mean"),
+        median_net=("net", "median"),
+        total_net=("net", "sum"),
+    ).reset_index()
+except TypeError:
+    # 구판다스/혼합환경 안전 경로
+    summary = summarize_trades(trades, by=("event", "expiry_h"))
+return trades_df, sdf
 
 
 # -------------------- 메인 --------------------
