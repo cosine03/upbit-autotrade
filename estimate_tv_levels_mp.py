@@ -32,12 +32,11 @@ def ensure_ts_col(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 def series_to_ns_utc(s: pd.Series) -> np.ndarray:
-    """tz-aware → tz-naive 변환 후 int64(ns)로 안전 변환 (pandas 2.2+ 호환)"""
     s = pd.to_datetime(s, utc=True, errors="coerce")
-    # tz-aware면 tz 제거
+    # tz-aware면 UTC로 통일 후 tz 제거
     if getattr(s.dtype, "tz", None) is not None:
         s = s.dt.tz_convert("UTC").dt.tz_localize(None)
-    # 명시적으로 datetime64[ns] → int64(ns)
+    # datetime64[ns] -> int64(ns)
     return s.astype("datetime64[ns]").astype("int64").to_numpy()
 
 def parse_side(row: dict) -> str:
