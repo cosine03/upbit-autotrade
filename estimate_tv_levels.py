@@ -25,7 +25,6 @@ VERSION = "ESTIMATOR-SP v1.1 (compat)"
 def _load_local_ohlcv(symbol: str, timeframe: str,
                       roots: List[str], patterns: List[str],
                       assume_tz: str = "UTC") -> Optional[pd.DataFrame]:
-    """roots+patterns 조합으로 CSV를 찾아 읽어 DatetimeIndex(+tz)로 반환."""
     for root in roots:
         for pat in patterns:
             rel = pat.format(symbol=symbol, timeframe=timeframe)
@@ -33,16 +32,17 @@ def _load_local_ohlcv(symbol: str, timeframe: str,
             if os.path.exists(path):
                 try:
                     df = pd.read_csv(path)
+
                     # ts/시간열 정규화
                     ts = None
                     cand_cols = ["ts", "time", "datetime", "date"]
                     for c in cand_cols:
                         if c in df.columns:
-                            ts = pd.to_datetime(df[c], utc=False, errors="coerce")
+                            ts = pd.to_datetime(df[c], errors="coerce")
                             break
                     if ts is None:
                         first_col = df.columns[0]
-                        ts = pd.to_datetime(df[first_col], utc=False, errors="coerce")
+                        ts = pd.to_datetime(df[first_col], errors="coerce")
 
                     # tz 지정 → UTC 변환
                     try:
@@ -91,7 +91,6 @@ def get_ohlcv_compat(symbol: str, timeframe: str,
         pass
     except Exception:
         pass
-
     # 2) 구버전 시도
     try:
         df = _core_get_ohlcv(symbol, timeframe)
@@ -99,7 +98,6 @@ def get_ohlcv_compat(symbol: str, timeframe: str,
             return df
     except Exception:
         pass
-
     # 3) 로컬 CSV 폴백
     return _load_local_ohlcv(symbol, timeframe, roots, patterns, assume_tz)
 
