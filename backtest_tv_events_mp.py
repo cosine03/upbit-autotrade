@@ -3,15 +3,15 @@ r"""
 BACKTEST TV EVENTS (LOCAL_SIM v3, no external deps)
 
 예)
-python -u backtest_tv_events_mp.py .\logs\signals_tv_enriched.csv ^
-  --timeframe 15m ^
-  --expiries 0.5h,1h,2h ^
-  --tp 1.5 --sl 0.8 --fee 0.001 ^
-  --dist-max 0.02 ^
-  --procs 24 ^
-  --ohlcv-roots ".;.\data;.\data\ohlcv;.\ohlcv;.\logs;.\logs\ohlcv" ^
-  --ohlcv-patterns "data/ohlcv/{symbol}-{timeframe}.csv;data/ohlcv/{symbol}_{timeframe}.csv;{symbol}-{timeframe}.csv;{symbol}_{timeframe}.csv" ^
-  --assume-ohlcv-tz UTC ^
+python -u backtest_tv_events_mp.py .\logs\signals_tv_enriched.csv `
+  --timeframe 15m `
+  --expiries 0.5h,1h,2h `
+  --tp 1.5 --sl 0.8 --fee 0.001 `
+  --dist-max 0.02 `
+  --procs 24 `
+  --ohlcv-roots ".;.\data;.\data\ohlcv;.\ohlcv;.\logs;.\logs\ohlcv" `
+  --ohlcv-patterns "data/ohlcv/{symbol}-{timeframe}.csv;data/ohlcv/{symbol}_{timeframe}.csv;{symbol}-{timeframe}.csv;{symbol}_{timeframe}.csv" `
+  --assume-ohlcv-tz UTC `
   --outdir .\logs\bt_tv_dm0020_tp1p5_sl0p8
 """
 
