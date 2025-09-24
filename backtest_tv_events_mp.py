@@ -25,6 +25,7 @@ from multiprocessing import Pool, cpu_count
 import numpy as np
 import pandas as pd
 
+from utils.agg import summarize_trades  # [PATCH] pandas-safe groupby aggregator
 
 # -------------------- 로컬 OHLCV 로딩 --------------------
 
@@ -348,20 +349,20 @@ def main():
         # 동일 포맷으로 출력
         stats = stats[["group", "event", "expiry_h", "trades", "win_rate", "avg_net", "median_net", "total_net"]]
         # 화면 요약
-        print("\n=== Summary (by event group & expiry) ===")
-        # group 단위 합치기
-        gsum = (
-            stats.groupby(["group", "expiry_h"])
-                 .agg({
-                     "trades": "sum",
-                     "win_rate": "mean",     # 단순 평균 (가중 필요하면 수정)
-                     "avg_net": "mean",
-                     "median_net": "median",
-                     "total_net": "sum",
-                 })
-                 .reset_index()
-                 .sort_values(["group", "expiry_h"])
-        )
+    # [PATCH] pandas-compat summary (no include_groups)
+    try:
+    # 신판다스에서만 되는 경로 (가능하면 사용)
+        summary = trades.groupby(["event", "expiry_h"], include_groups=False)["net"].agg(
+            trades=("net", "count"),
+            win_rate=(lambda s: (s > 0).mean()),
+            avg_net=("net", "mean"),
+            median_net=("net", "median"),
+            total_net=("net", "sum"),
+        ).reset_index()
+    except TypeError:
+        # 구판다스/혼합환경 안전 경로
+        summary = summarize_trades(trades, by=("event", "expiry_h"))
+
         # 보기 좋게 소수점 조정
         pd.options.display.float_format = lambda v: f"{v:,.6f}"
         print(gsum.to_string(index=False))
