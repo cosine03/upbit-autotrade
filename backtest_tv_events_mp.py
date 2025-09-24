@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 backtest_tv_events_mp.py
 - TradingView 신호(logs/signals_tv_enriched.csv 등)를 읽어, 로컬 OHLCV(CSV)로 멀티프로세싱 백테스트
 - 외부 의존성 없음 (로컬 csv만 사용)
@@ -275,13 +275,17 @@ def simulate_symbol(symbol: str,
     if trades:
         tdf = pd.DataFrame(trades)
         # 이벤트별 요약 (심볼 단위)
-        sdf = tdf.groupby(["event", "expiry_h"], include_groups=False)["net"].agg(
-            trades="count",
-            win_rate=lambda x: (x > 0).mean(),
-            avg_net="mean",
-            median_net="median",
-            total_net="sum",
-        ).reset_index()
+        sdf = (
+            tdf.groupby(["event", "expiry_h"])["net"]
+               .agg(
+                   trades="count",
+                   win_rate=lambda s: float((s > 0).mean()),
+                   avg_net="mean",
+                   median_net="median",
+                   total_net="sum",
+               )
+               .reset_index()
+        )
         return tdf, sdf
     else:
         return pd.DataFrame(), pd.DataFrame()
