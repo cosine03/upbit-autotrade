@@ -1,278 +1,282 @@
-# estimate_tv_levels.py
-# ---------------------
-# signals_tv.csv를 읽어 각 신호 시점의 가격과 추정 레벨(박스)을 계산하고
-# price와 level 간 괴리율(distance_pct, %)을 추가한 CSV를 저장합니다.
-#
-# 특징
-# - timeframe 컬럼이 비어 있거나 없어도 --timeframe 값으로 자동 보정
-# - tz-naive/aware 혼합 안전 처리 (UTC로 통일)
-# - 심볼/타임프레임별 로컬 OHLCV CSV 자동 탐색 (여러 경로 시도)
-# - 신호 시점 바로 이전 구간(window)에서 레벨 근사:
-#     * support  : 최근 구간 'low'의 5% 분위수 (Q5)
-#     * resistance: 최근 구간 'high'의 95% 분위수 (Q95)
-# - distance_pct = |price - est_level| / est_level * 100
-# - 실패 원인(OHLCV 없음, 인덱스 실패 등) 명시 저장
-#
-# 사용 예:
-#   python estimate_tv_levels.py .\logs\signals_tv.csv \
-#       --timeframe 15m \
-#       --http-timeout 8 --retries 4 --throttle 0.10 \
-#       --out .\logs\signals_tv_enriched.csv
-#
-# OHLCV 파일 규칙(아래 경로들을 순서대로 탐색합니다. 존재하는 첫 파일 사용):
-#   ./ohlcv/{symbol}_{timeframe}.csv
-#   ./ohlcv/upbit_{symbol}_{timeframe}.csv
-#   ./ohlcv/upbit/{symbol}_{timeframe}.csv
-# CSV 컬럼은 최소한: ts, open, high, low, close 필요
-# ts는 UTC(+00:00) 기준 권장(다른 tz여도 자동 보정됨)
-# ---------------------
+# estimate_tv_levels.py (robust)
+# -------------------------------------------------------------------
+# signals_tv.csv를 읽어 신호 시점 가격/레벨을 추정하고 distance_pct(%)를 추가 저장.
+# - 경로 탐색 강화(glob)
+# - tz-naive OHLCV용 타임존 가정 옵션(--assume-ohlcv-tz)
+# - 실패 사유(est_note) 집계 출력
+# -------------------------------------------------------------------
 
-import argparse
-import os
+import argparse, os, sys, re
 from pathlib import Path
-import sys
-import time
-
 import numpy as np
 import pandas as pd
+from typing import Optional, Tuple, List
+import glob
 
-
-# ---------- 유틸 ----------
-
+# ---------- args ----------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("signals", help="signals_tv.csv (또는 유사 포맷)")
-    p.add_argument("--timeframe", default="15m", help="기본 timeframe (CSV에 없거나 비었을 때 보정)")
+    p.add_argument("signals", help="signals_tv.csv")
+    p.add_argument("--timeframe", default="15m", help="CSV에 없거나 공백일 때 기본 timeframe")
     p.add_argument("--out", default="./logs/signals_tv_enriched.csv", help="출력 CSV 경로")
-    # 아래 3개는 로컬 OHLCV 버전에서는 사용하지 않지만, 인자 수용을 위해 둠(무시)
+
+    # 네가 넘기던 옵션들(로컬판에서 기능적으로 쓰진 않지만 허용)
     p.add_argument("--http-timeout", type=float, default=8.0)
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--throttle", type=float, default=0.10)
 
+    # *** 중요: OHLCV 타임존 가정 (tz-naive일 때 적용)
+    p.add_argument("--assume-ohlcv-tz", default="UTC",
+                   help="OHLCV ts가 tz-naive일 때 가정할 타임존 (예: UTC, Asia/Seoul)")
+
     # 레벨 추정 파라미터
-    p.add_argument("--lookback-bars", type=int, default=300, help="레벨 추정시 뒤로 볼 바 개수")
-    p.add_argument("--q-support", type=float, default=0.05, help="support 레벨 추정 분위수 (0~1)")
-    p.add_argument("--q-resistance", type=float, default=0.95, help="resistance 레벨 추정 분위수 (0~1)")
+    p.add_argument("--lookback-bars", type=int, default=300)
+    p.add_argument("--q-support", type=float, default=0.05)
+    p.add_argument("--q-resistance", type=float, default=0.95)
     return p.parse_args()
 
+# ---------- utils ----------
+def log(msg): print(msg, flush=True)
 
-def log(msg):
-    print(msg, flush=True)
+# timeframe 정규화/별칭
+_TF_ALIASES = {
+    "1m": ["1m","1","1min","1t"],
+    "3m": ["3m","3","3min","3t"],
+    "5m": ["5m","5","5min","5t"],
+    "10m": ["10m","10","10min","10t"],
+    "15m": ["15m","15","15min","15t"],
+    "30m": ["30m","30","30min","30t"],
+    "1h": ["1h","60m","60","1hr","1hour"],
+    "2h": ["2h","120m","120","2hr","2hours"],
+    "4h": ["4h","240m","240","4hr","4hours"],
+    "8h": ["8h","480m","480","8hr","8hours"],
+    "12h":["12h","720m","720","12hr","12hours"],
+    "1d": ["1d","1day","1440m","1440","d","day"],
+}
+def normalize_tf(tf: str) -> str:
+    t = str(tf).strip().lower()
+    for k, al in _TF_ALIASES.items():
+        if t in al: return k
+    return t  # 모르는 값은 그대로
 
+def to_utc_series(x, assume_tz: str="UTC"):
+    """
+    Series/array/iterable -> UTC Timestamp Series
+    tz-aware는 UTC 변환, tz-naive는 assume_tz로 localize 후 UTC 변환.
+    """
+    s = pd.to_datetime(pd.Series(x), errors="coerce", utc=False)
+    # tz-aware와 tz-naive 혼재 가능 -> 개별 처리
+    out = []
+    for ts in s:
+        if pd.isna(ts):
+            out.append(pd.NaT)
+        else:
+            if ts.tzinfo is None:
+                try:
+                    ts_local = ts.tz_localize(assume_tz)
+                except Exception:
+                    # 잘못된 tz 문자열일 수 있어, fallback: UTC로 가정
+                    ts_local = ts.tz_localize("UTC")
+                out.append(ts_local.tz_convert("UTC"))
+            else:
+                out.append(ts.tz_convert("UTC"))
+    return pd.Series(out, dtype="datetime64[ns, UTC]")
 
-def to_utc_ts(s):
-    """UTC로 안전 변환 (tz-aware/naive 모두 허용). 실패 시 NaT."""
-    if not isinstance(s, pd.Series):
-        s = pd.Series(s)
-    out = pd.to_datetime(s, utc=True, errors="coerce")
-    return out
-
-
-def normalize_signals(df, default_tf):
-    # 필수 컬럼 보정
-    need_cols = ["ts", "event", "side", "symbol", "timeframe"]
-    for c in need_cols:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    # 문자열 정리
-    for c in ["event", "side", "symbol", "timeframe"]:
+def normalize_signals(df: pd.DataFrame, default_tf: str) -> pd.DataFrame:
+    need = ["ts","event","side","symbol","timeframe"]
+    for c in need:
+        if c not in df.columns: df[c] = np.nan
+    for c in ["event","side","symbol","timeframe"]:
         df[c] = df[c].astype(str).str.strip()
+    df.loc[(df["timeframe"]== "") | (df["timeframe"].str.lower()=="nan"), "timeframe"] = default_tf
+    df["timeframe"] = df["timeframe"].map(normalize_tf)
 
-    # timeframe 공백/NaN 보정 -> 기본값
-    df.loc[(df["timeframe"] == "") | (df["timeframe"].str.lower() == "nan"), "timeframe"] = default_tf
-    df["timeframe"] = df["timeframe"].str.lower()
+    df["event"]  = df["event"].str.lower()
+    df["side"]   = df["side"].str.lower()
+    df["symbol"] = df["symbol"].str.replace(r"\s+","", regex=True)
 
-    # 이벤트/사이드 정규화(소문자)
-    df["event"] = df["event"].str.lower()
-    df["side"] = df["side"].str.lower()
-
-    # 타임스탬프 UTC 변환
-    df["ts"] = to_utc_ts(df["ts"])
-
-    # 심볼 공백 제거
-    df["symbol"] = df["symbol"].str.replace(r"\s+", "", regex=True)
-
-    # 유효행만 남기기
+    df["ts"] = to_utc_series(df["ts"], assume_tz="UTC")  # TV 신호는 보통 UTC로 왔다고 가정
     keep = df["ts"].notna() & df["symbol"].ne("") & df["timeframe"].ne("") & df["event"].ne("") & df["side"].ne("")
     return df.loc[keep].reset_index(drop=True)
 
-
-def find_ohlcv_path(symbol, timeframe):
-    """여러 경로 후보 중 존재하는 CSV 첫번째 반환, 없으면 None"""
-    candidates = [
-        f"./ohlcv/{symbol}_{timeframe}.csv",
-        f"./ohlcv/upbit_{symbol}_{timeframe}.csv",
-        f"./ohlcv/upbit/{symbol}_{timeframe}.csv",
+# ---------- OHLCV loading ----------
+def candidate_patterns(symbol: str, tf: str) -> List[str]:
+    # 다양한 파일명/폴더 패턴 지원
+    # ex) KRW-ADA_15m.csv, KRW-ADA-15m.csv, upbit_KRW-ADA_15m.csv, 폴더분할 등
+    bases = [
+        "./ohlcv", "./ohlcv_tv", "./data/ohlcv", "./logs/ohlcv", "./data", "./logs"
     ]
-    for p in candidates:
+    seps = ["_", "-"]
+    tf_alts = _TF_ALIASES.get(tf, []) + [tf]
+    names = []
+    for b in bases:
+        for alt in tf_alts:
+            for sep in seps:
+                names.append(f"{b}/{symbol}{sep}{alt}.csv")
+                names.append(f"{b}/upbit_{symbol}{sep}{alt}.csv")
+                names.append(f"{b}/upbit/{symbol}{sep}{alt}.csv")
+                names.append(f"{b}/{tf}/{symbol}.csv")
+                names.append(f"{b}/{symbol}/{alt}.csv")
+    # glob 하위까지 스캔: 파일명에 symbol/tf가 모두 포함되는 후보
+    globs = []
+    for root in bases:
+        globs += glob.glob(os.path.join(root, "**", "*.csv"), recursive=True)
+
+    # symbol, tf 키워드 둘 다 들어간 것만 추가
+    sym_key = symbol.lower()
+    tf_keys = set([x.lower() for x in tf_alts])
+    for path in globs:
+        low = path.lower().replace("\\","/")
+        if sym_key in low and any(tk in low for tk in tf_keys):
+            names.append(path)
+    # 중복 제거, 존재하는 것만
+    uniq = []
+    seen = set()
+    for p in names:
+        if p in seen: continue
+        seen.add(p)
         if os.path.isfile(p):
-            return p
-    return None
+            uniq.append(p)
+    return uniq
 
-
-def load_ohlcv(symbol, timeframe):
-    """로컬 OHLCV 로드(ts, open, high, low, close). UTC로 정규화."""
-    path = find_ohlcv_path(symbol, timeframe)
-    if path is None:
-        return None, f"OHLCV file not found for {symbol} {timeframe}"
-
+def load_ohlcv(symbol: str, timeframe: str, assume_tz: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    cands = candidate_patterns(symbol, timeframe)
+    if not cands:
+        return None, f"not_found:{symbol}_{timeframe}"
+    # 첫 일치 파일 사용
+    path = cands[0]
     try:
         df = pd.read_csv(path)
     except Exception as e:
-        return None, f"read_csv error: {e}"
+        return None, f"read_csv:{e}"
 
-    # 필수 컬럼 체크
-    for c in ["ts", "open", "high", "low", "close"]:
+    for c in ["ts","open","high","low","close"]:
         if c not in df.columns:
-            return None, f"missing column '{c}' in {path}"
+            return None, f"missing_col:{c}"
+    # tz 보정
+    df["ts"] = to_utc_series(df["ts"], assume_tz=assume_tz)
+    df = df.dropna(subset=["ts","open","high","low","close"]).sort_values("ts").reset_index(drop=True)
+    if df.empty:
+        return None, "empty_after_clean"
 
-    # 시간 정규화
-    df["ts"] = to_utc_ts(df["ts"])
-    df = df.dropna(subset=["ts", "open", "high", "low", "close"]).reset_index(drop=True)
-    df = df.sort_values("ts").reset_index(drop=True)
     return df, None
 
-
-def search_index_at_or_before(ts_array, key_ts):
-    """
-    ts_array: 정렬된 UTC 타임스탬프 시리즈/배열
-    key_ts: UTC Timestamp
-    반환: key_ts가 속한(또는 바로 이전) 바의 인덱스 (없으면 -1)
-    """
-    # numpy datetime64[ns]로 통일
-    a = pd.Series(ts_array).astype("datetime64[ns]").to_numpy()
+# ---------- core ----------
+def search_index_at_or_before(ts_series: pd.Series, key_ts: pd.Timestamp) -> int:
+    a = pd.to_datetime(ts_series, utc=True).astype("datetime64[ns]").to_numpy()
     k = pd.to_datetime(key_ts, utc=True)
-    if pd.isna(k):
-        return -1
+    if pd.isna(k): return -1
     k64 = np.datetime64(k.to_datetime64())
-    # 오른쪽 삽입 후 -1: '이전' 위치
     idx = int(np.searchsorted(a, k64, side="right")) - 1
     return idx
 
-
-def estimate_level(window_df, side, q_support=0.05, q_resistance=0.95):
-    """
-    간단 근사:
-      support    -> window low의 q_support 분위수
-      resistance -> window high의 q_resistance 분위수
-    """
+def estimate_level(window_df: pd.DataFrame, side: str, q_s: float, q_r: float) -> Tuple[float, str]:
     if window_df.empty:
-        return np.nan, "empty window"
-
+        return np.nan, "empty_window"
     if side == "support":
-        level = float(np.nanquantile(window_df["low"].to_numpy(), q_support))
-        return level, ""
-    elif side == "resistance":
-        level = float(np.nanquantile(window_df["high"].to_numpy(), q_resistance))
-        return level, ""
-    else:
-        return np.nan, f"unknown side '{side}'"
+        return float(np.nanquantile(window_df["low"].to_numpy(), q_s)), ""
+    if side == "resistance":
+        return float(np.nanquantile(window_df["high"].to_numpy(), q_r)), ""
+    return np.nan, f"unknown_side:{side}"
 
-
-# ---------- 메인 파이프라인 ----------
-
+# ---------- main ----------
 def main():
     args = parse_args()
 
-    # 입력 로드
     try:
-        df_sig_raw = pd.read_csv(args.signals)
+        df_raw = pd.read_csv(args.signals)
     except Exception as e:
-        log(f"[EST] ERROR: cannot read signals file: {e}")
+        log(f"[EST] ERROR read signals: {e}")
         sys.exit(1)
 
-    df_sig = normalize_signals(df_sig_raw.copy(), default_tf=args.timeframe)
+    df = normalize_signals(df_raw.copy(), args.timeframe)
+    valid_events = {"level2_detected","level3_detected","price_in_box","box_breakout","line_breakout"}
+    df = df[df["event"].isin(valid_events)].reset_index(drop=True)
 
-    # Paul 지표 이벤트만 유지(혹시 다른 이벤트가 섞였을 경우)
-    valid_events = {"level2_detected", "level3_detected", "price_in_box", "box_breakout", "line_breakout"}
-    df_sig = df_sig[df_sig["event"].isin(valid_events)].reset_index(drop=True)
+    # 결과 컬럼
+    df["price_at_signal"] = np.nan
+    df["est_level"] = np.nan
+    df["distance_pct"] = np.nan
+    df["bars_lookback_used"] = np.nan
+    df["est_note"] = ""
 
-    if df_sig.empty:
-        # 아무 행도 없으면 그대로 저장만
+    if df.empty:
         Path(os.path.dirname(args.out) or ".").mkdir(parents=True, exist_ok=True)
-        df_sig.to_csv(args.out, index=False)
+        df.to_csv(args.out, index=False)
         log(f"[EST] done. saved -> {args.out}")
         log(f"[EST] success 0/0 rows")
         return
 
-    # 결과 컬럼 준비
-    df_sig["price_at_signal"] = np.nan
-    df_sig["est_level"] = np.nan
-    df_sig["distance_pct"] = np.nan
-    df_sig["bars_lookback_used"] = np.nan
-    df_sig["est_note"] = ""
-
-    # 심볼/타임프레임 단위로 처리
-    total = len(df_sig)
-    ok = 0
-
-    # 미리 심볼/TF별 OHLCV 로드 캐시
+    # 캐시
     cache = {}
+    ok = 0
+    total = len(df)
+    df = df.sort_values(["symbol","timeframe","ts"]).reset_index(drop=True)
 
-    # 정렬(안전)
-    df_sig = df_sig.sort_values(["symbol", "timeframe", "ts"]).reset_index(drop=True)
-
-    for i, row in df_sig.iterrows():
-        sym = row["symbol"]
-        tf = row["timeframe"]
-        ts = row["ts"]
-        side = row["side"]
+    for i, r in df.iterrows():
+        sym = r["symbol"]
+        tf  = normalize_tf(r["timeframe"])
+        ts  = r["ts"]
+        side= r["side"]
 
         key = (sym, tf)
         if key not in cache:
-            ohlcv, err = load_ohlcv(sym, tf)
-            cache[key] = (ohlcv, err)
+            oh, err = load_ohlcv(sym, tf, assume_tz=args.assume_ohlcv_tz)
+            cache[key] = (oh, err)
         else:
-            ohlcv, err = cache[key]
+            oh, err = cache[key]
 
-        if ohlcv is None:
-            df_sig.at[i, "est_note"] = f"ohlcv_error: {err}"
+        if oh is None:
+            df.at[i,"est_note"] = f"ohlcv:{err}"
             continue
 
-        # 시그널 시점 이전 바 인덱스
-        idx = search_index_at_or_before(ohlcv["ts"], ts)
+        idx = search_index_at_or_before(oh["ts"], ts)
         if idx < 0:
-            df_sig.at[i, "est_note"] = "index_not_found_before_ts"
+            df.at[i,"est_note"] = "index_not_found_before_ts"
             continue
 
-        # 신호 시점 가격(해당 바 close로 정의)
-        price = float(ohlcv.at[idx, "close"])
-        df_sig.at[i, "price_at_signal"] = price
+        price = float(oh.at[idx,"close"])
+        df.at[i,"price_at_signal"] = price
 
-        # lookback window
         i0 = max(0, idx - int(args.lookback_bars) + 1)
-        window = ohlcv.iloc[i0:idx + 1].copy()
-
-        # 레벨 근사
-        level, note = estimate_level(
-            window, side,
-            q_support=float(args.q_support),
-            q_resistance=float(args.q_resistance),
-        )
-        if not np.isfinite(level) or level <= 0:
-            df_sig.at[i, "est_note"] = note if note else "invalid_level"
+        win = oh.iloc[i0:idx+1]
+        level, note = estimate_level(win, side, args.q_support, args.q_resistance)
+        if not np.isfinite(level) or level<=0:
+            df.at[i,"est_note"] = note if note else "invalid_level"
             continue
 
-        df_sig.at[i, "est_level"] = level
-        df_sig.at[i, "bars_lookback_used"] = len(window)
-
-        # 괴리율(%)
-        dist_pct = abs(price - level) / level * 100.0
-        df_sig.at[i, "distance_pct"] = dist_pct
-
+        df.at[i,"est_level"] = level
+        df.at[i,"bars_lookback_used"] = len(win)
+        df.at[i,"distance_pct"] = abs(price - level) / level * 100.0
         ok += 1
-        # 가벼운 진행 표시(큰 파일 대비 과도한 출력 방지)
-        if ok % 100 == 0:
-            log(f"[EST] progress: {ok}/{total} ok")
 
     # 저장
     Path(os.path.dirname(args.out) or ".").mkdir(parents=True, exist_ok=True)
-    df_sig.to_csv(args.out, index=False)
-
+    df.to_csv(args.out, index=False)
     log(f"[EST] done. saved -> {args.out}")
     log(f"[EST] success {ok}/{total} rows")
 
+    # 원인 요약
+    vc = df["est_note"].fillna("").value_counts()
+    if len(vc):
+        log("[EST] notes summary (top 10):")
+        for k, v in vc.head(10).items():
+            kshow = k if k else "(empty)"
+            log(f"  - {kshow}: {v}")
+
+    # 문제된 심볼/TF 몇 개 힌트 출력
+    if ok < total:
+        bad = df[df["est_note"].ne("")]
+        if not bad.empty:
+            ex = bad.groupby(["symbol","timeframe"])["est_note"].head(1).reset_index(drop=True)
+            log("[EST] examples of issues:")
+            for row in ex.head(10):
+                pass
+            # 더 간단히: 심볼/TF별 첫 에러 표시
+            for (sym, tf), sub in bad.groupby(["symbol","timeframe"]):
+                log(f"  - {sym} {tf}: {sub['est_note'].iloc[0]}")
+                # 10개만
+                if len(ex.head(10))==10: break
 
 if __name__ == "__main__":
     main()
