@@ -1,19 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Pre-filter: keep only line_breakout signals that had a recent price_in_box
-for the same symbol (optionally same level_id if present), and within a distance threshold.
+Filter: keep only line_breakout signals that had a recent price_in_box (same symbol),
+and within a distance threshold.
 
 Usage:
 python -u filter_boxin_linebreak.py .\logs\signals_tv_enriched.csv ^
   --out .\logs\signals_boxin_linebreak.csv ^
   --lookback-hours 48 ^
   --dist-max 0.00025 ^
-  --require-same-level
+  [--require-same-level]
+
+Notes:
+- dist_max expects RATIO scale (e.g., 0.00025 = 0.025%). If your distance_pct is in 0..100,
+  the script auto-detects and converts.
 """
+from __future__ import annotations
+
 import argparse
 import pandas as pd
 import numpy as np
-
 
 def detect_scale(series: pd.Series) -> str:
     s = pd.to_numeric(series, errors="coerce").dropna()
@@ -21,89 +26,95 @@ def detect_scale(series: pd.Series) -> str:
         return "ratio"
     return "ratio" if float(s.max()) <= 1.0 else "percent"
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("signals", help="signals_tv_enriched.csv path")
     ap.add_argument("--out", required=True, help="output CSV path")
     ap.add_argument("--lookback-hours", type=int, default=48)
-    ap.add_argument("--dist-max", type=float, default=0.00025,
-                    help="RATIO scale (e.g., 0.00025 = 0.025%)")
+    ap.add_argument("--dist-max", type=float, default=0.00025, help="RATIO (0.00025=0.025%)")
     ap.add_argument("--require-same-level", action="store_true",
-                    help="if level_id columns exist, require same level between box and breakout")
+                    help="if *_id columns exist, require same level between box and breakout")
     args = ap.parse_args()
 
     df = pd.read_csv(args.signals)
-    if "event" not in df.columns or "symbol" not in df.columns:
-        raise SystemExit("Required columns missing: event, symbol")
-    if "ts" not in df.columns:
-        raise SystemExit("Required column missing: ts")
+    for col in ["event", "symbol", "ts", "distance_pct"]:
+        if col not in df.columns:
+            raise SystemExit(f"Required column missing: {col}")
 
-    # normalize timestamp
+    # timestamp normalize
     df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
     df = df.dropna(subset=["ts"]).copy()
 
-    # normalize distance to ratio
-    if "distance_pct" not in df.columns:
-        raise SystemExit("Required column missing: distance_pct")
+    # distance normalize -> ratio
     scale = detect_scale(df["distance_pct"])
     dist_ratio = pd.to_numeric(df["distance_pct"], errors="coerce")
     if scale == "percent":
         dist_ratio = dist_ratio / 100.0
     df["distance_ratio"] = dist_ratio
 
-    # gather price_in_box events
-    keep_cols = ["symbol", "ts"]
-    level_cols = []
-    for c in ["level_id", "box_id", "line_id"]:
-        if c in df.columns:
-            level_cols.append(c)
-    keep_cols += level_cols
+    # prepare price_in_box rows (keep optional id columns)
+    level_cols = [c for c in ["level_id", "box_id", "line_id"] if c in df.columns]
+    keep_cols = ["symbol", "ts"] + level_cols
+    box_all = df.loc[df["event"] == "price_in_box", keep_cols].copy()
 
-    box = df.loc[df["event"] == "price_in_box", keep_cols].copy()
-    box = box.sort_values(["symbol", "ts"]).reset_index(drop=True)
-    if box.empty:
-        df.iloc[0:0].to_csv(args.out, index=False, encoding="utf-8")
-        print("[FILTER] No price_in_box in input -> 0 rows written")
+    # fast exit if no box
+    if box_all.empty:
+        pd.DataFrame(columns=df.columns).to_csv(args.out, index=False, encoding="utf-8")
+        print("[FILTER] No price_in_box found -> 0 rows written")
         return
 
-    # asof join: attach last box ts per symbol
-    df_sorted = df.sort_values(["symbol", "ts"]).reset_index(drop=True)
-    box_sorted = box.sort_values(["symbol", "ts"]).reset_index(drop=True)
-    df2 = pd.merge_asof(
-        df_sorted, box_sorted,
-        on="ts", by="symbol", direction="backward",
-        suffixes=("", "_last_box")
-    )
+    # group-wise asof merge (per symbol)
+    groups = []
+    for sym, g in df.groupby("symbol", sort=False):
+        g = g.sort_values("ts").reset_index(drop=True)
+        box_g = box_all[box_all["symbol"] == sym].sort_values("ts").reset_index(drop=True)
 
-    # lookback check
+        if box_g.empty:
+            g["ts_last_box"] = pd.NaT
+            for lc in level_cols:
+                g[f"{lc}_last_box"] = pd.NA
+        else:
+            # right side: keep ts for join + duplicate as ts_last_box + suffix level cols
+            box_r = box_g.copy()
+            box_r["ts_last_box"] = box_r["ts"]
+            for lc in level_cols:
+                box_r.rename(columns={lc: f"{lc}_last_box"}, inplace=True)
+
+            merged = pd.merge_asof(
+                g, box_r.drop(columns=["symbol"]),  # same symbol already
+                on="ts", direction="backward"
+            )
+            g = merged
+
+        groups.append(g)
+
+    df2 = pd.concat(groups, ignore_index=True)
+
+    # within lookback?
     dt_sec = (df2["ts"] - df2["ts_last_box"]).dt.total_seconds()
     df2["box_lookback_ok"] = (df2["ts_last_box"].notna()) & (dt_sec <= args.lookback_hours * 3600)
 
-    # same-level check (optional)
-    if args.require_same_level and level_cols:
+    # require same level if requested
+    if args.require-same-level and level_cols:
         same_flags = []
-        for c in level_cols:
-            last_c = f"{c}_last_box"
-            if c in df2.columns and last_c in df2.columns:
-                same_flags.append(df2[c].astype(str) == df2[last_c].astype(str))
+        for lc in level_cols:
+            last = f"{lc}_last_box"
+            if last in df2.columns:
+                same_flags.append(df2[lc].astype(str) == df2[last].astype(str))
         df2["same_level"] = np.logical_or.reduce(same_flags) if same_flags else False
         df2["box_lookback_ok"] &= df2["same_level"]
     else:
         df2["same_level"] = np.nan
 
-    # distance check
+    # distance filter & final event pick
     df2["dist_ok"] = (df2["distance_ratio"] >= 0) & (df2["distance_ratio"] <= args.dist_max)
-
-    # final mask
     mask = (df2["event"] == "line_breakout") & df2["box_lookback_ok"] & df2["dist_ok"]
     out = df2.loc[mask].copy()
 
     out.to_csv(args.out, index=False, encoding="utf-8")
-    print(f"[FILTER] scale={scale} | in={len(df)} -> out={len(out)} "
-          f"| lookback_h={args.lookback_hours} dist_max={args.dist_max} "
+    print(f"[FILTER] scale={scale} | in={len(df)} -> out={len(out)} | "
+          f"lookback_h={args.lookback_hours} dist_max={args.dist_max} "
           f"| require_same_level={args.require_same_level}")
-
 
 if __name__ == "__main__":
     main()
