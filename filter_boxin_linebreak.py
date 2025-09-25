@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 Filter: keep only line_breakout signals that had a recent price_in_box (same symbol),
 and within a distance threshold.
 
