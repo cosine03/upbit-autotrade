@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 Filter: keep only line_breakout signals that had a recent price_in_box (same symbol),
 and within a distance threshold.
 
@@ -96,7 +96,7 @@ def main():
     df2["box_lookback_ok"] = (dt <= args.lookback_hours * 3600)
 
     # 6) require same level (옵션)
-    if args.require-same-level and level_cols:
+    if args.require_same_level and level_cols:
         same_flags = []
         for lc in level_cols:
             last = f"{lc}_last_box"
