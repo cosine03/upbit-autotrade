@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 Dynamic recommender for (1) dist_max and (2) TP/SL per event.
 
 Usage example:
