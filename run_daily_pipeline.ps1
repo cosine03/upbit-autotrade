@@ -2,6 +2,13 @@ Param(
   [ValidateSet("AM","PM")][string]$TagHalf = "AM"
 )
 
+# venv Python 강제 사용 (스크립트 범위 alias)
+$venvPy = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+if (Test-Path $venvPy) { Set-Alias -Name python -Value $venvPy -Scope Script }
+
+# pandas가 pyarrow 끌어오는 지연 방지
+$env:PANDAS_IGNORE_PYARROW = "1"
+
 # ===== Safety =====
 $ErrorActionPreference = "Stop"
 $env:PANDAS_IGNORE_PYARROW = "1"   # avoid heavy pyarrow import
