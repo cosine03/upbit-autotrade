@@ -4,6 +4,7 @@ Param(
 
 # ===== Safety =====
 $ErrorActionPreference = "Stop"
+$env:PANDAS_IGNORE_PYARROW = "1"   # avoid heavy pyarrow import
 
 # ===== Date/Paths =====
 $DATE = Get-Date -Format "yyyy-MM-dd"
@@ -35,31 +36,32 @@ Copy-Item $cfg.paths.signals_current $archivedSignals -Force
 Write-Host "[SIGNALS] Archived -> $archivedSignals"
 
 # ===== 2) 동적 파라미터 산출 & dist_max 자동 적용 =====
+$distToUse = [double]$cfg.dist_max   # default
 $dynJson = Join-Path $OUT "dynamic_params.json"
-python -u .\dynamic_params.py `
-  --signals $archivedSignals `
-  --grid-csv $cfg.paths.grid_summary `
-  --target-lo 20 --target-hi 30 `
-  --events box_breakout,line_breakout,price_in_box `
-  --min-trades 30 --metric avg_net `
-  --clamp-min 0.0 --clamp-max 0.001 `
-  --out $dynJson
+try {
+  python -u .\dynamic_params.py `
+    --signals $archivedSignals `
+    --grid-csv $cfg.paths.grid_summary `
+    --target-lo 20 --target-hi 30 `
+    --events box_breakout,line_breakout,price_in_box `
+    --min-trades 30 --metric avg_net `
+    --clamp-min 0.0 --clamp-max 0.001 `
+    --out $dynJson
 
-# dist_max 기본값
-$distToUse = [double]$cfg.dist_max
-if (Test-Path $dynJson) {
-  try {
+  if (Test-Path $dynJson) {
     $dyn = Get-Content $dynJson | ConvertFrom-Json
-    # dynamic_params.py가 추천값을 value_ratio로 내줌(없으면 fallback)
-    if ($dyn.dist_max.value_ratio -ne $null) {
-      $distToUse = [double]$dyn.dist_max.value_ratio
-    } elseif ($dyn.dist_max.value -ne $null) {
-      $distToUse = [double]$dyn.dist_max.value
+    $v = $null
+    if ($dyn.dist_max.value_ratio -ne $null) { $v = [double]$dyn.dist_max.value_ratio }
+    elseif ($dyn.dist_max.value -ne $null)   { $v = [double]$dyn.dist_max.value }
+    if ($v -ne $null) {
+      # clamp
+      if ($dyn.dist_max.clamp.min -ne $null -and $v -lt [double]$dyn.dist_max.clamp.min) { $v = [double]$dyn.dist_max.clamp.min }
+      if ($dyn.dist_max.clamp.max -ne $null -and $v -gt [double]$dyn.dist_max.clamp.max) { $v = [double]$dyn.dist_max.clamp.max }
+      $distToUse = $v
     }
-    # 안전 클램프
-    if ($dyn.dist_max.clamp.min -ne $null) { if ($distToUse -lt [double]$dyn.dist_max.clamp.min) { $distToUse = [double]$dyn.dist_max.clamp.min } }
-    if ($dyn.dist_max.clamp.max -ne $null) { if ($distToUse -gt [double]$dyn.dist_max.clamp.max) { $distToUse = [double]$dyn.dist_max.clamp.max } }
-  } catch { Write-Warning "[DYNAMIC] Failed to read dynamic_params.json, using default dist_max=$distToUse" }
+  }
+} catch {
+  Write-Warning "[DYNAMIC] dynamic estimation failed. Using default dist_max=$distToUse"
 }
 Write-Host "[DYNAMIC] dist_max to use =" $distToUse
 
