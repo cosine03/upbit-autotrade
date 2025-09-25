@@ -19,30 +19,17 @@ if (-not (Test-Path $cfgPath)) { throw "pipeline_config.json not found." }
 $cfg = Get-Content $cfgPath | ConvertFrom-Json
 
 # ===== 0) OHLCV 업데이트 =====
-# 심볼 소스: 1) configs\universe.txt 있으면 그걸 사용
-#            2) 없으면 금일 signals 파일에서 'symbol' 컬럼 추출하여 임시 리스트 생성
+# 심볼 목록은 universe.txt(한 줄에 하나)에서 읽음
 $symbolsFile = ".\configs\universe.txt"
-$tmpSymbols  = "$OUT\symbols_tmp.txt"
-
-if (Test-Path $symbolsFile) {
-  Write-Host "[OHLCV] Using symbols from $symbolsFile"
-} else {
-  if (-not (Test-Path $cfg.paths.signals_current)) {
-    throw "signals_current not found: $($cfg.paths.signals_current)"
-  }
-  Write-Host "[OHLCV] universe.txt not found. Extracting symbols from today's signals..."
-  # CSV에서 symbol 컬럼 추출
-  Import-Csv $cfg.paths.signals_current | Select-Object -ExpandProperty symbol | Sort-Object -Unique | Out-File -FilePath $tmpSymbols -Encoding ascii
-  $symbolsFile = $tmpSymbols
+if (-not (Test-Path $symbolsFile)) {
+  throw "configs\universe.txt not found. Create it with one symbol per line (e.g., KRW-BTC)."
 }
 
-# 실제 업데이트 호출 (필요 시 fetch 스크립트 옵션 맞춰 조정)
-# 예: --timeframe 15m, 출력 디렉토리: data\ohlcv
 Write-Host "[OHLCV] Fetching ..."
 python -u .\fetch_ohlcv_upbit.py `
-  --symbols @"$symbolsFile" `
+  --symbols-file "$symbolsFile" `
   --timeframe $cfg.timeframe `
-  --out .\data\ohlcv
+  --outdir .\data\ohlcv
 
 # ===== 1) TV enriched 신호 백업 =====
 if (-not (Test-Path $cfg.paths.signals_current)) {
