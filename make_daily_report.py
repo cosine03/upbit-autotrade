@@ -1,78 +1,50 @@
 # -*- coding: utf-8 -*-
 import os
-os.environ.setdefault("MPLBACKEND", "Agg")  # non-interactive backend
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import argparse, os as _os
 import pandas as pd
 import numpy as np
 
-# ---- helpers ----
-def compute_equity_and_mdd(trades: pd.DataFrame, group_cols=("strategy","expiry_h")):
-    """
-    trades columns expected:
-      - ts_entry (optional), event, expiry_h, net (per trade PnL), strategy
-    Return dict: {(strategy, expiry): (equity_df, mdd_float)}
-    """
+def compute_equity_and_mdd(trades: pd.DataFrame, group_cols=("expiry_h",)):
     out = {}
     if "net" not in trades.columns:
         return out
-    # sort by time if available
     if "ts_entry" in trades.columns:
         trades["ts_entry"] = pd.to_datetime(trades["ts_entry"], errors="coerce", utc=True)
-        trades = trades.sort_values(["strategy","expiry_h","ts_entry"])
+        trades = trades.sort_values(["expiry_h","ts_entry"])
     for keys, g in trades.groupby(list(group_cols)):
         eq = g["net"].cumsum().reset_index(drop=True)
         peak = eq.cummax()
         dd = eq - peak
         mdd = dd.min() if len(dd) else 0.0
         equity = pd.DataFrame({"step": np.arange(len(eq)), "equity": eq.values})
-        out[keys] = (equity, float(mdd))
+        out[keys if isinstance(keys, tuple) else (keys,)] = (equity, float(mdd))
     return out
-
-def save_bar(ax, df, title, ycol):
-    for col in df.columns[1:]:
-        ax.bar([f"{x} {col}" for x in df[df.columns[0]]], df[col])
-    ax.set_title(title); ax.set_xlabel(f"{df.columns[0]} x strategy"); ax.set_ylabel(ycol)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in1", required=True, help="summary csv for breakout-only")
-    ap.add_argument("--in2", required=True, help="summary csv for boxin-linebreak subset")
-    ap.add_argument("--trades1", required=True, help="trades csv for breakout-only")
-    ap.add_argument("--trades2", required=True, help="trades csv for boxin-linebreak")
-    ap.add_argument("--out", required=True, help="output xlsx")
-    ap.add_argument("--tag", default="", help="date tag to annotate")
+    ap.add_argument("--summary", required=True, help="bt_tv_events_stats_summary.csv (single strategy)")
+    ap.add_argument("--trades",  required=True, help="bt_tv_events_trades.csv")
+    ap.add_argument("--out",     required=True, help="output xlsx")
+    ap.add_argument("--tag",     default="")
+    ap.add_argument("--strategy", default="boxin_linebreak")
     args = ap.parse_args()
 
-    # summaries
-    b = pd.read_csv(args.in1)
-    s = pd.read_csv(args.in2)
+    s = pd.read_csv(args.summary)
+    t = pd.read_csv(args.trades)
+
+    # keep core cols
     keep = ["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"]
-    b = b[keep].copy(); s = s[keep].copy()
-    b["strategy"] = "breakout_only"; s["strategy"] = "boxin_linebreak"
-    both = pd.concat([b,s], ignore_index=True)
+    s = s[keep].copy()
 
-    # trades
-    tb = pd.read_csv(args.trades1)
-    ts = pd.read_csv(args.trades2)
-    tb["strategy"] = "breakout_only"
-    ts["strategy"] = "boxin_linebreak"
-    trades = pd.concat([tb, ts], ignore_index=True)
+    with pd.ExcelWriter(args.out, engine="openpyxl") as w:
+        s.to_excel(w, sheet_name="summary", index=False)
+        t.to_excel(w, sheet_name="trades",  index=False)
 
-    # write sheets
-    with pd.ExcelWriter(args.out, engine="openpyxl") as writer:
-        b.to_excel(writer, sheet_name="breakout_only", index=False)
-        s.to_excel(writer, sheet_name="boxin_linebreak", index=False)
-        both.to_excel(writer, sheet_name="combined", index=False)
-        trades.to_excel(writer, sheet_name="trades", index=False)
-
-        # pivot summaries
-        pivot_avg = both.pivot_table(index=["expiry_h"], columns="strategy", values="avg_net", aggfunc="mean").reset_index()
-        pivot_tot = both.pivot_table(index=["expiry_h"], columns="strategy", values="total_net", aggfunc="sum").reset_index()
-        pivot_wr  = both.pivot_table(index=["expiry_h"], columns="strategy", values="win_rate", aggfunc="mean").reset_index()
-        pivot_avg.to_excel(writer, sheet_name="pivots", startrow=0, index=False)
-        pivot_tot.to_excel(writer, sheet_name="pivots", startrow= pivot_avg.shape[0]+3, index=False)
-        pivot_wr.to_excel(writer,  sheet_name="pivots", startrow= pivot_avg.shape[0]+pivot_tot.shape[0]+6, index=False)
+        # pivots by expiry
+        pv = s.pivot_table(index="expiry_h", values=["trades","win_rate","avg_net","total_net"], aggfunc={"trades":"sum","win_rate":"mean","avg_net":"mean","total_net":"sum"}).reset_index()
+        pv.to_excel(w, sheet_name="pivot_by_expiry", index=False)
 
     # charts
     import matplotlib.pyplot as plt
@@ -80,46 +52,49 @@ def main():
     from openpyxl.drawing.image import Image as XLImage
 
     base = _os.path.splitext(args.out)[0]
-    png1, png2, png3 = base+"_avg_net.png", base+"_total_net.png", base+"_win_rate.png"
+    p1, p2, p3 = base+"_avg_net.png", base+"_total_net.png", base+"_win_rate.png"
 
-    fig, ax = plt.subplots(figsize=(8,5)); save_bar(ax, pivot_avg, f"AVG_NET by expiry ({args.tag})", "avg_net"); plt.tight_layout(); plt.savefig(png1); plt.close()
-    fig, ax = plt.subplots(figsize=(8,5)); save_bar(ax, pivot_tot, f"TOTAL_NET by expiry ({args.tag})", "total_net"); plt.tight_layout(); plt.savefig(png2); plt.close()
-    fig, ax = plt.subplots(figsize=(8,5)); save_bar(ax, pivot_wr,  f"WIN_RATE by expiry ({args.tag})", "win_rate"); plt.tight_layout(); plt.savefig(png3); plt.close()
+    # simple bars
+    fig, ax = plt.subplots(figsize=(7,4))
+    plt.bar(pv["expiry_h"].astype(str), pv["avg_net"]); ax.set_title(f"AVG_NET by expiry ({args.tag})"); ax.set_xlabel("expiry_h"); ax.set_ylabel("avg_net"); plt.tight_layout(); plt.savefig(p1); plt.close()
+
+    fig, ax = plt.subplots(figsize=(7,4))
+    plt.bar(pv["expiry_h"].astype(str), pv["total_net"]); ax.set_title(f"TOTAL_NET by expiry ({args.tag})"); ax.set_xlabel("expiry_h"); ax.set_ylabel("total_net"); plt.tight_layout(); plt.savefig(p2); plt.close()
+
+    fig, ax = plt.subplots(figsize=(7,4))
+    plt.bar(pv["expiry_h"].astype(str), pv["win_rate"]); ax.set_title(f"WIN_RATE by expiry ({args.tag})"); ax.set_xlabel("expiry_h"); ax.set_ylabel("win_rate"); plt.tight_layout(); plt.savefig(p3); plt.close()
 
     # equity & MDD
-    emap = compute_equity_and_mdd(trades)
-    # 저장용 이미지들
+    emap = compute_equity_and_mdd(t)
     eq_imgs = []
-    for (strategy, expiry), (eqdf, mdd) in emap.items():
-        fn = f"{base}_equity_{strategy}_{expiry}.png"
-        plt.figure(figsize=(8,4))
+    for (expiry,), (eqdf, mdd) in emap.items():
+        fn = f"{base}_equity_{expiry}h.png"
+        plt.figure(figsize=(7,3.5))
         plt.plot(eqdf["step"], eqdf["equity"])
-        plt.title(f"Equity Curve - {strategy} - {expiry}h | MDD={mdd:.4f}")
-        plt.xlabel("trade idx"); plt.ylabel("cumulative net")
+        plt.title(f"Equity Curve - {args.strategy} - {expiry}h | MDD={mdd:.4f}")
+        plt.xlabel("trade idx"); plt.ylabel("cum net")
         plt.tight_layout(); plt.savefig(fn); plt.close()
-        eq_imgs.append((fn, strategy, expiry, mdd))
+        eq_imgs.append((fn, expiry, mdd))
 
     # insert images
     wb = load_workbook(args.out)
     ws = wb.create_sheet("charts")
-    ws["A1"] = f"Tag: {args.tag}"
+    ws["A1"] = f"Strategy: {args.strategy} | Tag: {args.tag}"
     row = 3
-    for p in (png1, png2, png3):
+    for p in (p1, p2, p3):
         if _os.path.exists(p):
-            img = XLImage(p); img.anchor = f"A{row}"; ws.add_image(img); row += 25
+            img = XLImage(p); img.anchor = f"A{row}"; ws.add_image(img); row += 22
 
-    # equity/mdd 섹션
+    # equity/mdd sheet
     ws2 = wb.create_sheet("equity_mdd")
-    ws2["A1"] = "strategy"; ws2["B1"] = "expiry_h"; ws2["C1"] = "MDD"
+    ws2["A1"] = "expiry_h"; ws2["B1"] = "MDD"
     r = 2
-    for fn, strategy, expiry, mdd in eq_imgs:
-        ws2[f"A{r}"] = strategy
-        ws2[f"B{r}"] = float(expiry)
-        ws2[f"C{r}"] = float(mdd)
-        # 그림
+    for fn, expiry, mdd in eq_imgs:
+        ws2[f"A{r}"] = float(expiry)
+        ws2[f"B{r}"] = float(mdd)
         if _os.path.exists(fn):
-            img = XLImage(fn); img.anchor = f"E{r}"; ws2.add_image(img)
-        r += 20
+            img = XLImage(fn); img.anchor = f"D{r}"; ws2.add_image(img)
+        r += 18
 
     wb.save(args.out)
     print("[REPORT] saved ->", args.out)
