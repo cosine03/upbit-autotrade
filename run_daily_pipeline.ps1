@@ -67,13 +67,9 @@ Write-Host "[DYNAMIC] dist_max to use =" $distToUse
 
 # ===== 3) Breakout-only 사전필터 (box_breakout + line_breakout) =====
 $boCsv = "$OUT\signals_breakout_only.csv"
-
-# CSV 읽어서 event가 box_breakout/line_breakout인 것만 필터
 Import-Csv -Path $archivedSignals |
   Where-Object { $_.event -in @("box_breakout","line_breakout") } |
   Export-Csv -Path $boCsv -NoTypeInformation -Encoding UTF8
-
-# 개수 로그
 $boCount = (Import-Csv -Path $boCsv | Measure-Object).Count
 Write-Host "[PRE] breakout-only rows:" $boCount
 
