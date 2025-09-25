@@ -65,31 +65,15 @@ Write-Host "[DYNAMIC] dist_max to use =" $distToUse
 
 # ===== 3) Breakout-only 사전필터 (box_breakout + line_breakout) =====
 $boCsv = "$OUT\signals_breakout_only.csv"
-python - << 'PY'
-import pandas as pd, sys
-src = r"%ARCH%"
-dst = r"%DST%"
-df = pd.read_csv(src)
-df = df[df["event"].isin(["box_breakout","line_breakout"])]
-df.to_csv(dst, index=False, encoding="utf-8")
-print("[PRE] breakout-only rows:", len(df))
-PY
-# replace tokens for inline python
-(Get-Content $boCsv) | Out-Null 2>$null # touch file if missing path var
-$archEsc = $archivedSignals -replace '\\','\\'
-$dstEsc  = $boCsv -replace '\\','\\'
-(Get-Content -Path "$OUT\signals_breakout_only.csv" -ErrorAction SilentlyContinue) | Out-Null
-$code = (Get-Content -Path "$PSCommandPath" -Raw) # dummy to hold scope
-# Re-run snippet with tokens
-python - << PY
-import pandas as pd
-src = r"$archEsc"
-dst = r"$dstEsc"
-df = pd.read_csv(src)
-df = df[df["event"].isin(["box_breakout","line_breakout"])]
-df.to_csv(dst, index=False, encoding="utf-8")
-print("[PRE] breakout-only rows:", len(df))
-PY
+
+# CSV 읽어서 event가 box_breakout/line_breakout인 것만 필터
+Import-Csv -Path $archivedSignals |
+  Where-Object { $_.event -in @("box_breakout","line_breakout") } |
+  Export-Csv -Path $boCsv -NoTypeInformation -Encoding UTF8
+
+# 개수 로그
+$boCount = (Import-Csv -Path $boCsv | Measure-Object).Count
+Write-Host "[PRE] breakout-only rows:" $boCount
 
 # ===== 4) Breakout-only 백테스트 (dist = dynamic) =====
 python -u $cfg.paths.backtest_script $boCsv `
