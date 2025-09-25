@@ -9,16 +9,12 @@ python -u filter_boxin_linebreak.py .\logs\signals_tv_enriched.csv ^
   --lookback-hours 48 ^
   --dist-max 0.00025 ^
   [--require-same-level]
-
-Notes:
-- dist_max expects RATIO scale (e.g., 0.00025 = 0.025%). If your distance_pct is in 0..100,
-  the script auto-detects and converts.
 """
 from __future__ import annotations
 
 import argparse
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 def detect_scale(series: pd.Series) -> str:
     s = pd.to_numeric(series, errors="coerce").dropna()
@@ -41,7 +37,7 @@ def main():
         if col not in df.columns:
             raise SystemExit(f"Required column missing: {col}")
 
-    # 1) timestamp normalize
+    # 1) timestamp normalize (LEFT)
     df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
     df = df.dropna(subset=["ts"]).copy()
 
@@ -52,55 +48,54 @@ def main():
         dist_ratio = dist_ratio / 100.0
     df["distance_ratio"] = dist_ratio
 
-    # 3) prepare price_in_box rows (keep optional id columns)
+    # 3) price_in_box rows (RIGHT)
     level_cols = [c for c in ["level_id", "box_id", "line_id"] if c in df.columns]
     keep_cols = ["symbol", "ts"] + level_cols
     box_all = df.loc[df["event"] == "price_in_box", keep_cols].copy()
 
-    # fast exit if no box
     if box_all.empty:
-        out_empty = df.iloc[0:0].copy()
-        out_empty.to_csv(args.out, index=False, encoding="utf-8")
+        df.head(0).to_csv(args.out, index=False, encoding="utf-8")
         print("[FILTER] No price_in_box found -> 0 rows written")
         return
 
-    # 4) group-wise asof merge (per symbol) — ensure sorted time within each symbol
-    groups = []
+    # 4) group-wise asof (symbol별 time-sort 준수)
+    parts = []
     for sym, g in df.groupby("symbol", sort=False):
         g = g.sort_values("ts").reset_index(drop=True)
-        box_g = box_all[box_all["symbol"] == sym].sort_values("ts").reset_index(drop=True)
+        b = box_all[box_all["symbol"] == sym].sort_values("ts").reset_index(drop=True)
 
-        if box_g.empty:
+        if b.empty:
             g["ts_last_box"] = pd.NaT
             for lc in level_cols:
                 g[f"{lc}_last_box"] = pd.NA
         else:
-            box_r = box_g.copy()
-            box_r["ts_last_box"] = box_r["ts"]
+            r = b.copy()
+            r["ts_last_box"] = r["ts"]
             for lc in level_cols:
-                box_r.rename(columns={lc: f"{lc}_last_box"}, inplace=True)
+                r.rename(columns={lc: f"{lc}_last_box"}, inplace=True)
 
-            merged = pd.merge_asof(
-                g, box_r.drop(columns=["symbol"]),
+            # merge_asof은 같은 심볼 내 시간축만 필요
+            g = pd.merge_asof(
+                g, r.drop(columns=["symbol"]),
                 on="ts", direction="backward"
             )
-            g = merged
 
-        groups.append(g)
+        parts.append(g)
 
-    df2 = pd.concat(groups, ignore_index=True)
+    df2 = pd.concat(parts, ignore_index=True)
 
-    # 5) cast merged ts_last_box to datetime (avoid .dt errors)
-    if "ts_last_box" in df2.columns:
-        df2["ts_last_box"] = pd.to_datetime(df2["ts_last_box"], utc=True, errors="coerce")
-    else:
-        df2["ts_last_box"] = pd.NaT
+    # 5) RIGHT ts 캐스팅(강제) -> dt 연산 안전화
+    df2["ts_last_box"] = pd.to_datetime(df2.get("ts_last_box"), utc=True, errors="coerce")
 
-    # 6) within lookback?
-    dt_sec = (df2["ts"] - df2["ts_last_box"]).dt.total_seconds()
-    df2["box_lookback_ok"] = (df2["ts_last_box"].notna()) & (dt_sec <= args.lookback_hours * 3600)
+    # NaT 안전 계산: numpy timedelta로 변환 후 NaT는 큰 값으로 치환
+    ts_ns   = df2["ts"].values.astype("datetime64[ns]")
+    last_ns = df2["ts_last_box"].values.astype("datetime64[ns]")
+    dt = (ts_ns - last_ns) / np.timedelta64(1, "s")   # float sec, NaT→nan
+    dt = np.where(np.isnan(dt), np.inf, dt)           # NaT는 lookback 실패로 간주
 
-    # 7) require same level if requested
+    df2["box_lookback_ok"] = (dt <= args.lookback_hours * 3600)
+
+    # 6) require same level (옵션)
     if args.require-same-level and level_cols:
         same_flags = []
         for lc in level_cols:
@@ -110,17 +105,17 @@ def main():
         df2["same_level"] = np.logical_or.reduce(same_flags) if same_flags else False
         df2["box_lookback_ok"] &= df2["same_level"]
     else:
-        df2["same_level"] = np.nan  # not used
+        df2["same_level"] = np.nan
 
-    # 8) distance filter & final event pick
+    # 7) distance & event filter
     df2["dist_ok"] = (df2["distance_ratio"] >= 0) & (df2["distance_ratio"] <= args.dist_max)
     mask = (df2["event"] == "line_breakout") & df2["box_lookback_ok"] & df2["dist_ok"]
     out = df2.loc[mask].copy()
 
     out.to_csv(args.out, index=False, encoding="utf-8")
     print(f"[FILTER] scale={scale} | in={len(df)} -> out={len(out)} | "
-          f"lookback_h={args.lookback_hours} dist_max={args.dist_max} "
-          f"| require_same_level={args.require-same-level if 'require-same-level' in vars() else False}")
+          f"lookback_h={args.lookback_hours} dist_max={args.dist_max} | "
+          f"require_same_level={args.require_same_level}")
 
 if __name__ == "__main__":
     main()
