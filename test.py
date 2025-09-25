@@ -1,24 +1,23 @@
-# 0) 원본 파일 지정 (네가 올린 그 파일 경로에 맞춰)
-$SRC = ".\logs\signals\signals_2025-09-25_AM.csv"   # 네 환경파일로 교체
-$OUT = ".\logs\daily\2025-09-25_AM"
+# 0) 경로/폴더 잡기
+$DATE = Get-Date -Format "yyyy-MM-dd"
+$TAG  = "${DATE}_SUPPORT_TEST"
+$OUT  = ".\logs\daily\$TAG"
+New-Item -ItemType Directory -Force -Path $OUT | Out-Null
 
-# 1) side 라벨이 이미 있으므로, 라벨링은 스킵 가능 (없으면 label_events_side.py 사용)
-# python -u .\label_events_side.py $SRC --out "$OUT\signals_labeled.csv"
+# 1) 소스 지정 (support 라벨 있는 원본)
+$SRC = ".\logs\signals_tv.csv"   # 네 파일 경로로 맞춰둔 상태
 
-# 2) support only + price_in_box만 우선 추출
-python -u .\filter_support_events.py $SRC `
+# 2) 라벨링(사이드/터치회수 등) - 안전하게 항상 거쳐가자
+python -u .\label_events_side.py $SRC `
+  --out "$OUT\signals_labeled.csv"
+
+# 3) support 전용 필터
+#    distance_pct가 없으면 자동으로 스킵하고 저장만 함(정상 동작)
+python -u .\filter_support_events.py "$OUT\signals_labeled.csv" `
   --out "$OUT\signals_support_only.csv" `
   --dist-max 0.000188 `
-  --include-substr "support,price_in_box,bounce"    # price_in_box 포함시켜둠
-# (--require-same-level 옵션은 나중에 켜서 더 타이트하게 테스트)
+  --include-substr "support,price_in_box,bounce"
+#  --require-same-level   # 필요하면 나중에 켜기
 
-# 3) 백테스트 (네 베이스라인과 동일 파라미터)
-python -u .\backtest_tv_events_mp.py "$OUT\signals_support_only.csv" `
-  --timeframe 15m --expiries 0.5h,1h,2h `
-  --tp 1.75 --sl 0.7 --fee 0.001 `
-  --dist-max 9 `
-  --procs 24 `
-  --ohlcv-roots ".;.\data;.\data\ohlcv;.\ohlcv;.\logs;.\logs\ohlcv" `
-  --ohlcv-patterns "data/ohlcv/{symbol}-{timeframe}.csv;data/ohlcv/{symbol}_{timeframe}.csv;{symbol}-{timeframe}.csv;{symbol}_{timeframe}.csv" `
-  --assume-ohlcv-tz UTC `
-  --outdir "$OUT\bt_support_only"
+# 4) 결과 확인 (행수만 체크)
+(Import-Csv "$OUT\signals_support_only.csv" | Measure-Object).Count
