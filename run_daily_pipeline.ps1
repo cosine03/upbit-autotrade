@@ -2,19 +2,59 @@ Param(
   [ValidateSet("AM","PM")][string]$TagHalf = "AM"
 )
 
+# ===== Safety =====
+$ErrorActionPreference = "Stop"
+
+# ===== Date/Paths =====
 $DATE = Get-Date -Format "yyyy-MM-dd"
 $TAG  = "${DATE}_$TagHalf"
 $OUT  = ".\logs\daily\$TAG"
 New-Item -ItemType Directory -Force -Path $OUT | Out-Null
+New-Item -ItemType Directory -Force -Path ".\logs\signals" | Out-Null
+New-Item -ItemType Directory -Force -Path ".\logs\history" | Out-Null
 
-$cfg = Get-Content ".\pipeline_config.json" | ConvertFrom-Json
+# ===== Load config =====
+$cfgPath = ".\pipeline_config.json"
+if (-not (Test-Path $cfgPath)) { throw "pipeline_config.json not found." }
+$cfg = Get-Content $cfgPath | ConvertFrom-Json
 
-# 1) Backup signals
-Copy-Item $cfg.paths.signals_current ".\logs\signals\signals_${TAG}.csv"
+# ===== 0) OHLCV 업데이트 =====
+# 심볼 소스: 1) configs\universe.txt 있으면 그걸 사용
+#            2) 없으면 금일 signals 파일에서 'symbol' 컬럼 추출하여 임시 리스트 생성
+$symbolsFile = ".\configs\universe.txt"
+$tmpSymbols  = "$OUT\symbols_tmp.txt"
 
-# 2) Dynamic params (reference-only grid)
+if (Test-Path $symbolsFile) {
+  Write-Host "[OHLCV] Using symbols from $symbolsFile"
+} else {
+  if (-not (Test-Path $cfg.paths.signals_current)) {
+    throw "signals_current not found: $($cfg.paths.signals_current)"
+  }
+  Write-Host "[OHLCV] universe.txt not found. Extracting symbols from today's signals..."
+  # CSV에서 symbol 컬럼 추출
+  Import-Csv $cfg.paths.signals_current | Select-Object -ExpandProperty symbol | Sort-Object -Unique | Out-File -FilePath $tmpSymbols -Encoding ascii
+  $symbolsFile = $tmpSymbols
+}
+
+# 실제 업데이트 호출 (필요 시 fetch 스크립트 옵션 맞춰 조정)
+# 예: --timeframe 15m, 출력 디렉토리: data\ohlcv
+Write-Host "[OHLCV] Fetching ..."
+python -u .\fetch_ohlcv_upbit.py `
+  --symbols @"$symbolsFile" `
+  --timeframe $cfg.timeframe `
+  --out .\data\ohlcv
+
+# ===== 1) TV enriched 신호 백업 =====
+if (-not (Test-Path $cfg.paths.signals_current)) {
+  throw "signals_current not found: $($cfg.paths.signals_current)"
+}
+$archivedSignals = ".\logs\signals\signals_${TAG}.csv"
+Copy-Item $cfg.paths.signals_current $archivedSignals -Force
+Write-Host "[SIGNALS] Archived -> $archivedSignals"
+
+# ===== 2) (옵션) dist_max/TP,SL 추천 =====
 python -u .\dynamic_params.py `
-  --signals ".\logs\signals\signals_${TAG}.csv" `
+  --signals $archivedSignals `
   --grid-csv $cfg.paths.grid_summary `
   --target-lo 20 --target-hi 30 `
   --events box_breakout,line_breakout,price_in_box `
@@ -22,8 +62,8 @@ python -u .\dynamic_params.py `
   --clamp-min 0.0 --clamp-max 0.001 `
   --out "$OUT\dynamic_params.json"
 
-# 3) Breakout-only
-python -u $cfg.paths.backtest_script ".\logs\signals\signals_${TAG}.csv" `
+# ===== 3) Breakout-only 백테스트 (dist 고정) =====
+python -u $cfg.paths.backtest_script $archivedSignals `
   --timeframe $cfg.timeframe `
   --expiries $cfg.expiries `
   --tp $cfg.tp --sl $cfg.sl --fee $cfg.fee `
@@ -34,13 +74,14 @@ python -u $cfg.paths.backtest_script ".\logs\signals\signals_${TAG}.csv" `
   --assume-ohlcv-tz $cfg.assume_ohlcv_tz `
   --outdir "$OUT\bt_breakout_only"
 
-# 4) Box-in Line Breakout
-python -u .\filter_boxin_linebreak.py ".\logs\signals\signals_${TAG}.csv" `
-  --out "$OUT\signals_boxin_linebreak.csv" `
+# ===== 4) Box-in Line Breakout (필터 → 백테스트) =====
+$filtered = "$OUT\signals_boxin_linebreak.csv"
+python -u .\filter_boxin_linebreak.py $archivedSignals `
+  --out $filtered `
   --lookback-hours $cfg.lookback_hours `
   --dist-max $cfg.dist_max
 
-python -u $cfg.paths.backtest_script "$OUT\signals_boxin_linebreak.csv" `
+python -u $cfg.paths.backtest_script $filtered `
   --timeframe $cfg.timeframe `
   --expiries $cfg.expiries `
   --tp $cfg.tp --sl $cfg.sl --fee $cfg.fee `
@@ -51,14 +92,14 @@ python -u $cfg.paths.backtest_script "$OUT\signals_boxin_linebreak.csv" `
   --assume-ohlcv-tz $cfg.assume_ohlcv_tz `
   --outdir "$OUT\bt_boxin_linebreak"
 
-# 5) Report
+# ===== 5) 일일 리포트(엑셀+차트) =====
 python -u .\make_daily_report.py `
   --in1 "$OUT\bt_breakout_only\bt_tv_events_stats_summary.csv" `
   --in2 "$OUT\bt_boxin_linebreak\bt_tv_events_stats_summary.csv" `
   --out "$OUT\daily_report.xlsx" `
   --tag $TAG
 
-# 6) Append history
+# ===== 6) 히스토리 누적 =====
 python -u .\append_history.py --summary "$OUT\bt_breakout_only\bt_tv_events_stats_summary.csv" `
   --strategy breakout_only --date $DATE `
   --history ".\logs\history\bt_breakout_only.csv"
