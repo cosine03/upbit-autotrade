@@ -1,18 +1,13 @@
 @echo off
-REM ===== Binance OHLCV append fetch (15m) =====
+chcp 65001 >NUL
 setlocal enabledelayedexpansion
 
-REM --- paths ---
 set "ROOT=D:\upbit_autotrade_starter"
-set "VENV=%ROOT%\.venv\Scripts"
-set "PY=%VENV%\python.exe"
+set "PY=%ROOT%\.venv\Scripts\python.exe"
 set "LOGDIR=%ROOT%\logs\fetch"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
-
-REM --- log file (고정 로그 + 누적 append) ---
 set "LOG=%LOGDIR%\binance_ohlcv_append.log"
 
-REM --- run ---
 cd /d "%ROOT%"
 echo [START] %DATE% %TIME% >> "%LOG%"
 "%PY%" fetch_ohlcv_binance.py ^
