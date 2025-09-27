@@ -86,3 +86,24 @@ $all | Export-Csv -LiteralPath $MergedSummaryOut -NoTypeInformation -Encoding UT
 
 Write-Host "merged summary saved -> $MergedSummaryOut"
 Write-Host "== DONE =="
+
+# == 메일 발송 ==
+$Subject = "[Upbit Daily $TagHalf] $DATE"
+$Body    = @"
+$DATE $TagHalf 리포트입니다.
+
+- breakout_only / boxin_linebreak 요약 CSV를 첨부했습니다.
+- 통합 요약: $(Split-Path $MergedSummaryOut -Leaf)
+"@
+
+$attachList = @()
+$attachList += $MergedSummaryOut
+$attachB = Join-Path $BtDirBreakout   "bt_tv_events_stats_summary.csv"
+$attachL = Join-Path $BtDirBoxLine    "bt_tv_events_stats_summary.csv"
+if (Test-Path $attachB) { $attachList += $attachB }
+if (Test-Path $attachL) { $attachList += $attachL }
+
+$attachArgs = @()
+foreach ($a in $attachList) { $attachArgs += @("--attach", $a) }
+
+& .\.venv\Scripts\python.exe .\send_email.py --subject $Subject --body $Body @attachArgs
