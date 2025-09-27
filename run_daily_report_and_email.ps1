@@ -30,6 +30,20 @@ $BtDirBreakout       = Join-Path $DailyDir "bt_breakout_only"
 $BtDirBoxLine        = Join-Path $DailyDir "bt_boxin_linebreak"
 $MergedSummaryOut    = Join-Path $DailyDir "bt_stats_summary_merged_${TagHalf}.csv"
 
+# Ensure-Dir $DailyDir ...
+if (-not (Test-Path -LiteralPath $DynParamsJson)) {
+  Write-Host "dynamic_params.json not found. Initializing with defaults..."
+  @{
+    timeframe = "15m"
+    expiries  = @("0.5h","1h","2h")
+    tp        = 1.75
+    sl        = 0.7
+    fee       = 0.001
+    entry     = "prev_close"
+    dist_max  = 0.00018879720703916502
+  } | ConvertTo-Json | Set-Content -Encoding UTF8 $DynParamsJson
+}
+
 # === 가드/진단 출력 ===
 Write-Host "== RUN START == Root=$Root  Half=$TagHalf  ==="
 Write-Host "DATE            : $DATE"
