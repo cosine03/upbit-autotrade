@@ -136,31 +136,59 @@ def parse_side(row: pd.Series) -> Optional[str]:
     return None
 
 # -------------------- 시뮬 엔진 (로컬 간단 버전) --------------------
-def _simulate_one_trade(ohlcv: pd.DataFrame, ts_sig: pd.Timestamp, tp_pct: float, sl_pct: float, fee: float, expiry_h: float, side: str) -> Optional[float]:
+def _simulate_one_trade(ohlcv: pd.DataFrame,
+                        ts_sig: pd.Timestamp,
+                        tp_pct: float, sl_pct: float, fee: float,
+                        expiry_h: float,
+                        side: str,
+                        entry_mode: str) -> Optional[float]:
+    # 타임스탬프/인덱스
     ts = pd.to_datetime(ohlcv["ts"], utc=True, errors="coerce")
     ts_idx = pd.DatetimeIndex(ts)
-    idx = int(ts_idx.searchsorted(ts_sig, side="right") - 1)
-    if idx < 0 or idx >= len(ohlcv):
-        return None
 
-    entry = float(ohlcv["close"].iloc[idx])
-    end_ts = ts_sig + pd.Timedelta(hours=expiry_h)
+    # 시그널 기준 직전/직후 바 인덱스
+    idx_prev = int(ts_idx.searchsorted(ts_sig, side="right") - 1)  # 직전 바
+    idx_next = int(ts_idx.searchsorted(ts_sig, side="left"))       # 시그널 시각을 포함/초과하는 첫 바(다음 바 역할)
 
-    look = ohlcv.iloc[idx + 1:].copy()
+    # 엔트리 결정
+    if entry_mode == "next_open":
+        # 다음 바 시가로 진입 가정
+        if idx_next < 0 or idx_next >= len(ohlcv):
+            return None
+        entry_idx = idx_next
+        entry = float(ohlcv["open"].iloc[entry_idx])
+        # 다음 바부터 관찰 (엔트리 바 포함 이후 구간에서 TP/SL 체크)
+        look = ohlcv.iloc[entry_idx:].copy()
+    else:
+        # 기본: 직전 바 종가로 진입 가정
+        if idx_prev < 0 or idx_prev >= len(ohlcv):
+            return None
+        entry_idx = idx_prev
+        entry = float(ohlcv["close"].iloc[entry_idx])
+        # 다음 바부터 관찰
+        look = ohlcv.iloc[entry_idx + 1:].copy()
+
     if look.empty:
         return None
+
+    # 만기 제한
+    end_ts = ts_sig + pd.Timedelta(hours=expiry_h)
     look = look[look["ts"] <= end_ts]
     if look.empty:
         return None
 
+    # TP/SL 가격
     tp_price = entry * (1 + tp_pct / 100.0)
     sl_price = entry * (1 - sl_pct / 100.0)
 
-    hit_tp_idx = None
-    hit_sl_idx = None
+    round_fee = 2 * fee
+
+    # 고저로 TP/SL 히트 체크 (가장 먼저 닿는 것 우선)
     highs = look["high"].to_numpy(dtype=float)
     lows  = look["low"].to_numpy(dtype=float)
 
+    hit_tp_idx = None
+    hit_sl_idx = None
     for i in range(len(look)):
         if highs[i] >= tp_price:
             hit_tp_idx = i
@@ -169,54 +197,21 @@ def _simulate_one_trade(ohlcv: pd.DataFrame, ts_sig: pd.Timestamp, tp_pct: float
             hit_sl_idx = i
             break
 
-    round_fee = 2 * fee
-
+    # 둘 다 안 닿으면 만기 종가 청산
     if hit_tp_idx is None and hit_sl_idx is None:
         exit_px = float(look["close"].iloc[-1])
         return float((exit_px - entry) / entry - round_fee)
 
+    # TP 우선/동시 도달 시 TP 승리
     if hit_tp_idx is not None and (hit_sl_idx is None or hit_tp_idx <= hit_sl_idx):
         return float((tp_price - entry) / entry - round_fee)
     else:
         return float((sl_price - entry) / entry - round_fee)
 
-def simulate_symbol(symbol: str,
-                    df_sym: pd.DataFrame,
-                    timeframe: str,
-                    tp: float, sl: float, fee: float,
-                    expiries_h: List[float],
-                    roots: List[str], patterns: List[str], assume_tz: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    ohlcv = get_ohlcv_csv(symbol, timeframe, roots, patterns, assume_tz)
-    if ohlcv is None or ohlcv.empty:
-        return EMPTY_TRADES.copy(), EMPTY_STATS.copy()
-
-    rows = []
-    for _, r in df_sym.iterrows():
-        ts_sig = to_utc_ts(r["ts"])
-        side = parse_side(r) or "support"
-        event = str(r.get("event", "detected"))
-        for eh in expiries_h:
-            net = _simulate_one_trade(ohlcv, ts_sig, tp, sl, fee, eh, side)
-            if net is None:
-                continue
-            rows.append({
-                "symbol": symbol,
-                "event": event,
-                "expiry_h": float(eh),
-                "net": float(net),
-            })
-
-    trades_df = pd.DataFrame(rows)
-    if trades_df.empty:
-        return trades_df, EMPTY_STATS.copy()
-
-    summary_df = summarize_trades(trades_df, by=("event", "expiry_h"))
-    return trades_df, summary_df
-
 # -------------------- 그룹 실행 --------------------
 def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
               tp: float, sl: float, fee: float, expiries_h: List[float],
-              procs: int, roots: List[str], patterns: List[str], assume_tz: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+              procs: int, roots: List[str], patterns: List[str], assume_tz: str, entry_mode: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     sub = df[df["event_group"] == group_name].copy()
     if sub.empty:
         print(f"[BT][{group_name}] no tasks.")
@@ -230,7 +225,8 @@ def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
             sub[sub["symbol"] == sym].copy(),
             timeframe, tp, sl, fee,
             expiries_h,
-            roots, patterns, assume_tz
+            roots, patterns, assume_tz,
+            entry_mode
         ))
 
     if procs <= 1:
@@ -261,6 +257,8 @@ def main():
     ap.add_argument("signals", help="signals_tv_enriched.csv")
     ap.add_argument("--timeframe", default="15m")
     ap.add_argument("--expiries", default="0.5h,1h,2h")
+    ap.add_argument("--entry", choices=["prev_close","next_open"], default="prev_close",
+                help="진입가 산정 방식: prev_close(기본), next_open")
     ap.add_argument("--tp", type=float, default=1.5, help="take-profit in percent (1.5 = 1.5%)")
     ap.add_argument("--sl", type=float, default=0.8, help="stop-loss in percent (0.8 = 0.8%)")
     ap.add_argument("--fee", type=float, default=0.001, help="per-side fee (0.001 = 0.1%)")
@@ -342,7 +340,7 @@ def main():
     results = []
     for grp in ["detected", "price_in_box", "box_breakout", "line_breakout"]:
         tr, st = run_group(df, grp, args.timeframe, args.tp, args.sl, args.fee,
-                           expiries_h, args.procs, roots, patterns, assume_tz)
+                           expiries_h, args.procs, roots, patterns, assume_tz, args.entry)
         # group 라벨 부여
         if not tr.empty:
             tr = tr.copy()
