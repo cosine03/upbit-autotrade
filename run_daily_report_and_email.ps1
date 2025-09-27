@@ -89,21 +89,28 @@ Write-Host "== DONE =="
 
 # == 메일 발송 ==
 $Subject = "[Upbit Daily $TagHalf] $DATE"
-$Body    = @"
+$Body = @"
 $DATE $TagHalf 리포트입니다.
 
-- breakout_only / boxin_linebreak 요약 CSV를 첨부했습니다.
-- 통합 요약: $(Split-Path $MergedSummaryOut -Leaf)
+- breakout_only / boxin_linebreak 요약 CSV를 첨부합니다.
+- 통합 요약 파일: $(Split-Path $MergedSummaryOut -Leaf)
 "@
 
+# 첨부 모으기 (있을 때만)
 $attachList = @()
-$attachList += $MergedSummaryOut
-$attachB = Join-Path $BtDirBreakout   "bt_tv_events_stats_summary.csv"
-$attachL = Join-Path $BtDirBoxLine    "bt_tv_events_stats_summary.csv"
-if (Test-Path $attachB) { $attachList += $attachB }
-if (Test-Path $attachL) { $attachList += $attachL }
+if (Test-Path -LiteralPath $MergedSummaryOut) { $attachList += $MergedSummaryOut }
+$sumBreak = Join-Path $BtDirBreakout  "bt_tv_events_stats_summary.csv"
+$sumBoxLn = Join-Path $BtDirBoxLine   "bt_tv_events_stats_summary.csv"
+if (Test-Path -LiteralPath $sumBreak) { $attachList += $sumBreak }
+if (Test-Path -LiteralPath $sumBoxLn) { $attachList += $sumBoxLn }
 
+# 인자 구성 후 호출
 $attachArgs = @()
 foreach ($a in $attachList) { $attachArgs += @("--attach", $a) }
 
 & .\.venv\Scripts\python.exe .\send_email.py --subject $Subject --body $Body @attachArgs
+if ($LASTEXITCODE -eq 0) {
+  Write-Host "[MAIL] sent ok."
+} else {
+  Write-Warning "[MAIL] send failed with code $LASTEXITCODE"
+}
