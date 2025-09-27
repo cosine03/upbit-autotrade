@@ -23,6 +23,23 @@ from multiprocessing import Pool, cpu_count
 import numpy as np
 import pandas as pd
 
+# -------------------- 안전 합치기 유틸 & 빈 DF 정의 --------------------
+EMPTY_TRADES = pd.DataFrame(
+    columns=["symbol", "event", "ts", "entry", "exit", "pnl", "net", "expiry_h"]
+)
+EMPTY_STATS = pd.DataFrame(
+    columns=["event", "expiry_h", "trades", "win_rate", "avg_net", "median_net", "total_net"]
+)
+
+def safe_concat(dfs, empty_df):
+    """빈 리스트이거나 전부 빈 DF면 empty_df 반환."""
+    if not dfs:
+        return empty_df.copy()
+    dfs = [d for d in dfs if isinstance(d, pd.DataFrame) and not d.empty]
+    if not dfs:
+        return empty_df.copy()
+    return pd.concat(dfs, ignore_index=True)
+
 # -------------------- pandas-safe aggregator (no include_groups) --------------------
 def summarize_trades(df: pd.DataFrame, by=("event", "expiry_h")) -> pd.DataFrame:
     """
@@ -171,7 +188,7 @@ def simulate_symbol(symbol: str,
                     roots: List[str], patterns: List[str], assume_tz: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     ohlcv = get_ohlcv_csv(symbol, timeframe, roots, patterns, assume_tz)
     if ohlcv is None or ohlcv.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return EMPTY_TRADES.copy(), EMPTY_STATS.copy()
 
     rows = []
     for _, r in df_sym.iterrows():
@@ -191,7 +208,7 @@ def simulate_symbol(symbol: str,
 
     trades_df = pd.DataFrame(rows)
     if trades_df.empty:
-        return trades_df, pd.DataFrame(columns=["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"])
+        return trades_df, EMPTY_STATS.copy()
 
     summary_df = summarize_trades(trades_df, by=("event", "expiry_h"))
     return trades_df, summary_df
@@ -203,7 +220,7 @@ def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
     sub = df[df["event_group"] == group_name].copy()
     if sub.empty:
         print(f"[BT][{group_name}] no tasks.")
-        return pd.DataFrame(), pd.DataFrame()
+        return EMPTY_TRADES.copy(), EMPTY_STATS.copy()
 
     symbols = sorted(sub["symbol"].unique().tolist())
     tasks = []
@@ -222,20 +239,21 @@ def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
         with Pool(processes=procs) as pool:
             parts = pool.starmap(simulate_symbol, tasks)
 
-# 수정 (무트레이드 가드)
-tr_list = [p[0] for p in parts if p and isinstance(p[0], pd.DataFrame) and not p[0].empty]
-st_list = [p[1] for p in parts if p and isinstance(p[1], pd.DataFrame) and not p[1].empty]
+    # ----- 무트레이드 가드 & 안전 합치기 -----
+    tr_list = [p[0] for p in parts if p and isinstance(p[0], pd.DataFrame) and not p[0].empty]
+    st_list = [p[1] for p in parts if p and isinstance(p[1], pd.DataFrame) and not p[1].empty]
 
-if not tr_list:
-    empty_tr = pd.DataFrame(columns=["symbol","event","ts","entry","exit","pnl","net","expiry_h"])
-    empty_st = pd.DataFrame(columns=["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"])
-    return empty_tr, empty_st
+    if not tr_list and not st_list:
+        print(f"[BT][{group_name}] no trades produced; returning empty frames.")
+        return EMPTY_TRADES.copy(), EMPTY_STATS.copy()
 
-trades = pd.concat(tr_list, ignore_index=True)
-stats  = pd.concat(st_list, ignore_index=True) if st_list else pd.DataFrame(
-    columns=["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"]
-)
-return trades, stats
+    trades = safe_concat(tr_list, EMPTY_TRADES)
+    stats  = safe_concat(st_list,  EMPTY_STATS)
+
+    if stats.empty:
+        stats = EMPTY_STATS.copy()
+
+    return trades, stats
 
 # -------------------- 메인 --------------------
 def main():
@@ -321,30 +339,37 @@ def main():
 
     print(f"[BT] signals rows={len(df)}, symbols={df['symbol'].nunique()}, timeframe={args.timeframe}")
 
-    all_trades = []
-    all_stats  = []
+    results = []
     for grp in ["detected", "price_in_box", "box_breakout", "line_breakout"]:
         tr, st = run_group(df, grp, args.timeframe, args.tp, args.sl, args.fee,
                            expiries_h, args.procs, roots, patterns, assume_tz)
+        # group 라벨 부여
         if not tr.empty:
+            tr = tr.copy()
             tr["group"] = grp
-            all_trades.append(tr)
         if not st.empty:
+            st = st.copy()
             st["group"] = grp
-            all_stats.append(st)
+        results.append((tr, st))
 
-    trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-    stats  = pd.concat(all_stats,  ignore_index=True) if all_stats  else pd.DataFrame()
+    trades = safe_concat([r[0] for r in results if r and len(r) > 0], EMPTY_TRADES)
+    stats  = safe_concat([r[1] for r in results if r and len(r) > 1], EMPTY_STATS)
 
     if not trades.empty:
         trades_path = os.path.join(outdir, "bt_tv_events_trades.csv")
         trades.to_csv(trades_path, index=False)
         print(f"[BT] trades saved -> {trades_path}")
+    else:
+        print("[BT] trades empty (no trades).")
+
     if not stats.empty:
         stats_raw_path = os.path.join(outdir, "bt_tv_events_stats_raw.csv")
         stats.to_csv(stats_raw_path, index=False)
         print(f"[BT] stats(raw) saved -> {stats_raw_path}")
+    else:
+        print("[BT] stats empty (no stats).")
 
+    # 요약 출력
     if not trades.empty:
         gsum = summarize_trades(trades, by=("event", "expiry_h"))
         gsum = gsum[["event", "expiry_h", "trades", "win_rate", "avg_net", "median_net", "total_net"]]
@@ -354,6 +379,8 @@ def main():
         summary_path = os.path.join(outdir, "bt_tv_events_stats_summary.csv")
         gsum.to_csv(summary_path, index=False)
         print(f"[BT] summary saved -> {summary_path}")
+    else:
+        print("\n[BT] SUMMARY: no trades, nothing to summarize.")
 
     print(f"\n[BT] done -> {outdir}")
 
