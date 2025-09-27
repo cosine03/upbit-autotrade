@@ -222,12 +222,20 @@ def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
         with Pool(processes=procs) as pool:
             parts = pool.starmap(simulate_symbol, tasks)
 
-    trades = pd.concat([p[0] for p in parts if p and isinstance(p[0], pd.DataFrame) and not p[0].empty],
-                       ignore_index=True) if parts else pd.DataFrame()
-    stats  = pd.concat([p[1] for p in parts if p and isinstance(p[1], pd.DataFrame) and not p[1].empty],
-                       ignore_index=True) if parts else pd.DataFrame()
+# 수정 (무트레이드 가드)
+tr_list = [p[0] for p in parts if p and isinstance(p[0], pd.DataFrame) and not p[0].empty]
+st_list = [p[1] for p in parts if p and isinstance(p[1], pd.DataFrame) and not p[1].empty]
 
-    return trades, stats
+if not tr_list:
+    empty_tr = pd.DataFrame(columns=["symbol","event","ts","entry","exit","pnl","net","expiry_h"])
+    empty_st = pd.DataFrame(columns=["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"])
+    return empty_tr, empty_st
+
+trades = pd.concat(tr_list, ignore_index=True)
+stats  = pd.concat(st_list, ignore_index=True) if st_list else pd.DataFrame(
+    columns=["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"]
+)
+return trades, stats
 
 # -------------------- 메인 --------------------
 def main():
