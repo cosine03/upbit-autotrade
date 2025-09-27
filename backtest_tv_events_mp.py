@@ -23,6 +23,35 @@ from multiprocessing import Pool, cpu_count
 import numpy as np
 import pandas as pd
 
+def simulate_symbol(symbol: str,
+                    df_sym: pd.DataFrame,
+                    timeframe: str,
+                    tp: float, sl: float, fee: float,
+                    expiries_h: List[float],
+                    roots: List[str], patterns: List[str], assume_tz: str,
+                    entry_mode: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ohlcv = get_ohlcv_csv(symbol, timeframe, roots, patterns, assume_tz)
+    if ohlcv is None or ohlcv.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rows = []
+    for _, r in df_sym.iterrows():
+        ts_sig = to_utc_ts(r["ts"])
+        side = parse_side(r) or "support"
+        event = str(r.get("event", "detected"))
+        for eh in expiries_h:
+            net = _simulate_one_trade(ohlcv, ts_sig, tp, sl, fee, eh, side, entry_mode)
+            if net is None:
+                continue
+            rows.append({"symbol": symbol, "event": event, "expiry_h": float(eh), "net": float(net)})
+
+    trades_df = pd.DataFrame(rows)
+    if trades_df.empty:
+        return trades_df, pd.DataFrame(columns=["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"])
+
+    summary_df = summarize_trades(trades_df, by=("event", "expiry_h"))
+    return trades_df, summary_df
+
 # -------------------- 안전 합치기 유틸 & 빈 DF 정의 --------------------
 EMPTY_TRADES = pd.DataFrame(
     columns=["symbol", "event", "ts", "entry", "exit", "pnl", "net", "expiry_h"]
@@ -211,11 +240,12 @@ def _simulate_one_trade(ohlcv: pd.DataFrame,
 # -------------------- 그룹 실행 --------------------
 def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
               tp: float, sl: float, fee: float, expiries_h: List[float],
-              procs: int, roots: List[str], patterns: List[str], assume_tz: str, entry_mode: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+              procs: int, roots: List[str], patterns: List[str], assume_tz: str,
+              entry_mode: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     sub = df[df["event_group"] == group_name].copy()
     if sub.empty:
         print(f"[BT][{group_name}] no tasks.")
-        return EMPTY_TRADES.copy(), EMPTY_STATS.copy()
+        return pd.DataFrame(), pd.DataFrame()
 
     symbols = sorted(sub["symbol"].unique().tolist())
     tasks = []
@@ -229,26 +259,31 @@ def run_group(df: pd.DataFrame, group_name: str, timeframe: str,
             entry_mode
         ))
 
-    if procs <= 1:
-        parts = [simulate_symbol(*t) for t in tasks]
+    parts = None
+    if procs > 1:
+        try:
+            # 윈도우 spawn 대응: 실패 시 자동 폴백
+            with Pool(processes=procs) as pool:
+                parts = pool.starmap(simulate_symbol, tasks)
+        except Exception as e:
+            print(f"[BT][{group_name}] multiproc failed ({type(e).__name__}: {e}); fallback to single-process.")
+            parts = [simulate_symbol(*t) for t in tasks]
     else:
-        with Pool(processes=procs) as pool:
-            parts = pool.starmap(simulate_symbol, tasks)
+        parts = [simulate_symbol(*t) for t in tasks]
 
-    # ----- 무트레이드 가드 & 안전 합치기 -----
     tr_list = [p[0] for p in parts if p and isinstance(p[0], pd.DataFrame) and not p[0].empty]
     st_list = [p[1] for p in parts if p and isinstance(p[1], pd.DataFrame) and not p[1].empty]
 
-    if not tr_list and not st_list:
+    if not tr_list:
         print(f"[BT][{group_name}] no trades produced; returning empty frames.")
-        return EMPTY_TRADES.copy(), EMPTY_STATS.copy()
+        empty_tr = pd.DataFrame(columns=["symbol","event","ts","entry","exit","pnl","net","expiry_h"])
+        empty_st = pd.DataFrame(columns=["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"])
+        return empty_tr, empty_st
 
-    trades = safe_concat(tr_list, EMPTY_TRADES)
-    stats  = safe_concat(st_list,  EMPTY_STATS)
-
-    if stats.empty:
-        stats = EMPTY_STATS.copy()
-
+    trades = pd.concat(tr_list, ignore_index=True)
+    stats  = pd.concat(st_list, ignore_index=True) if st_list else pd.DataFrame(
+        columns=["event","expiry_h","trades","win_rate","avg_net","median_net","total_net"]
+    )
     return trades, stats
 
 # -------------------- 메인 --------------------
