@@ -1,8 +1,8 @@
-# 스크립트 위치 기준으로 이동
+# 스크립트 실행 위치를 Root로 설정
 Set-Location -Path (Split-Path -Parent $MyInvocation.MyCommand.Definition)
 
-# reports 폴더 확인 후 없으면 생성
-$ReportDir = Join-Path -Path (Get-Location) -ChildPath "logs\report"
+# reports 폴더 보장
+$ReportDir = Join-Path -Path (Get-Location) -ChildPath "logs\reports"
 if (-not (Test-Path $ReportDir)) {
     New-Item -ItemType Directory -Force -Path $ReportDir | Out-Null
 }
