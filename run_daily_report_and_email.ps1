@@ -7,8 +7,7 @@ run_daily_report_and_email.ps1
   2) bt_breakout_only\bt_tv_events_stats_summary.csv
   3) bt_boxin_linebreak\bt_tv_events_stats_summary.csv
 
-필수: 루트 경로(.env, logs, scripts)가 이 스크립트와 같은 폴더에 있다고 가정.
-.Gmail 사용 시 .env 예:
+.env 예 (Gmail):
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=you@gmail.com
@@ -29,8 +28,8 @@ $ErrorActionPreference = "Stop"
 # ---------- Path & Date ----------
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
-
 $DATE = Get-Date -Format "yyyy-MM-dd"
+
 $DailyDir   = Join-Path $Root "logs\daily\${DATE}_$TagHalf"
 $ReportsDir = Join-Path $Root "logs\reports"
 if (-not (Test-Path $ReportsDir)) { New-Item -ItemType Directory -Force -Path $ReportsDir | Out-Null }
@@ -52,19 +51,19 @@ function Load-DotEnv($path) {
   if (Test-Path -LiteralPath $path) {
     Get-Content $path | ForEach-Object {
       $line = $_.Trim()
-      if (-not $line) { return }                   # 빈 줄 skip
-      if ($line -match '^\s*#') { return }         # 전체 주석 줄 skip
-      # (1) 라인 끝 주석 제거 (# 이후로 잘라냄)
+      if (-not $line) { return }                    # 빈 줄 skip
+      if ($line -match '^\s*#') { return }          # 전체 주석 줄 skip
+      # 라인 끝 주석 제거
       if ($line.Contains('#')) {
         $line = $line.Split('#')[0].Trim()
         if (-not $line) { return }
       }
-      # (2) key=value 파싱
+      # key=value
       $parts = $line.Split('=', 2)
       if ($parts.Count -ne 2) { return }
       $k = $parts[0].Trim()
       $v = $parts[1].Trim()
-      # (3) 값 감싼 따옴표 제거
+      # 값 감싼 따옴표 제거
       if (($v.StartsWith('"') -and $v.EndsWith('"')) -or
           ($v.StartsWith("'") -and $v.EndsWith("'"))) {
         $v = $v.Substring(1, $v.Length-2)
@@ -101,10 +100,11 @@ Write-Log "MergedSummary   : $MergedSummary"
 if ($RunPipeline) {
   try {
     Write-Log "[PIPE] start"
-
     if (-not (Test-Path $DailyDir)) { New-Item -ItemType Directory -Force -Path $DailyDir | Out-Null }
 
-    # (여기에 신호 분리/백테스트 호출을 넣을 수 있음. 현재는 요약 병합만 수행)
+    # (필요시: 신호 분리/백테스트 호출 추가)
+
+    # 요약 병합
     if ((Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
       $b = Import-Csv $BreakoutSummary
       $l = Import-Csv $BoxLineSummary
@@ -115,13 +115,11 @@ if ($RunPipeline) {
     } else {
       Write-Log "[PIPE][WARN] summary files missing; skip merge."
     }
-
     Write-Log "[PIPE] done"
   } catch {
     Write-Log "[PIPE][ERROR] $($_.Exception.Message)"
   }
 } else {
-  # 파이프라인을 돌리지 않는 경우: merged 없으면 만들어 준다(가능한 경우)
   if ((-not (Test-Path $MergedSummary)) -and (Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
     try {
       $b = Import-Csv $BreakoutSummary
@@ -152,19 +150,17 @@ Write-Log "MAIL_TO=$MAIL_TO"
 $subject = "[Autotrade] Daily Report $DATE $TagHalf"
 $body = @"
 자동 생성 리포트 ($DATE $TagHalf)
-
 첨부:
   - $(Split-Path $MergedSummary -Leaf)
   - $(Split-Path $BreakoutSummary -Leaf)
   - $(Split-Path $BoxLineSummary -Leaf)
-
 로그: $(Resolve-Path $EmailLog)
 "@
 
-# 수신자 배열 정리(콤마/세미콜론 구분 허용)
+# 수신자 배열 정리 (콤마/세미콜론)
 $ToList = @()
 if ($MAIL_TO) {
-  $MAIL_TO.Split(',;') | ForEach-Object {
+  ($MAIL_TO -split '[,;]') | ForEach-Object {
     $addr = $_.Trim()
     if ($addr) { $ToList += $addr }
   }
@@ -174,7 +170,7 @@ if (-not $ToList -or $ToList.Count -eq 0) {
   throw "MAIL_TO empty"
 }
 
-# 첨부 파일 존재 확인
+# 첨부 파일
 $Attachments = @()
 foreach ($p in @($MergedSummary, $BreakoutSummary, $BoxLineSummary)) {
   if (Test-Path $p) {
@@ -204,29 +200,29 @@ function Send-ReportMail {
   $msg = New-Object System.Net.Mail.MailMessage
   if ($From) { $msg.From = $From } else { throw "MAIL_FROM is empty" }
   foreach ($to in $ToList) { [void]$msg.To.Add($to) }
-  $msg.Subject            = $Subject
-  $msg.SubjectEncoding    = $enc
-  $msg.IsBodyHtml         = $false
+  $msg.Subject         = $Subject
+  $msg.SubjectEncoding = $enc
+  $msg.IsBodyHtml      = $false
 
-  # --- 핵심: 본문을 AlternateView로 UTF-8/Quoted-Printable 지정 ---
+  # 본문을 AlternateView로 UTF-8 / Quoted-Printable
   $alt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($Body, $enc, "text/plain")
   $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::QuotedPrintable
   $msg.AlternateViews.Clear()
-  $msg.AlternateViews.Add($alt)
+  [void]$msg.AlternateViews.Add($alt)
 
-  # (호환용으로 Body에도 세팅하되 인코딩 강제)
+  # 호환용 Body 세팅
   $msg.Body         = $Body
   $msg.BodyEncoding = $enc
   if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding') { $msg.HeadersEncoding = $enc }
 
-  # 첨부: 파일명 인코딩
+  # 첨부
   foreach ($p in $Attachments) {
     if ($p -and (Test-Path -LiteralPath $p)) {
       $att = New-Object System.Net.Mail.Attachment($p)
       if ($att.PSObject.Properties.Name -contains 'NameEncoding') {
         $att.NameEncoding = $enc
       }
-      $msg.Attachments.Add($att) | Out-Null
+      [void]$msg.Attachments.Add($att)
     }
   }
 
