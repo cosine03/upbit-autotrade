@@ -204,11 +204,20 @@ function Send-ReportMail {
   $msg.SubjectEncoding = $enc
   $msg.IsBodyHtml      = $false
 
-  # 본문을 AlternateView로 UTF-8 / Quoted-Printable
-  $alt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($Body, $enc, "text/plain")
-  $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::QuotedPrintable
+  # === 본문을 AlternateView로 UTF-8 + Base64 전송 (가장 호환성 좋음) ===
+  $enc = [System.Text.Encoding]::UTF8
+  $plainType = New-Object System.Net.Mime.ContentType "text/plain; charset=utf-8"
+  $alt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($Body, $enc, $plainType.MediaType)
+  $alt.ContentType.CharSet = "utf-8"
+  $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::Base64
   $msg.AlternateViews.Clear()
   [void]$msg.AlternateViews.Add($alt)
+
+  # 호환용으로 Body에도 동일 데이터/인코딩 지정
+  $msg.Body         = $Body
+  $msg.BodyEncoding = $enc
+  $msg.SubjectEncoding = $enc
+  if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding') { $msg.HeadersEncoding = $enc }
 
   # 호환용 Body 세팅
   $msg.Body         = $Body
