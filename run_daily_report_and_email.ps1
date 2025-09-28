@@ -60,7 +60,7 @@ function Load-DotEnv($path) {
     $k,$v = $line -split "=",2
     $k = $k.Trim()
     $v = $v.Trim().Trim("'`"").Trim()              # strip quotes if any
-    if ($k) { $env:$k = $v }
+    if ($k) { Set-Item -Path ("Env:{0}" -f $k) -Value $v }
   }
   Write-Log ".env loaded."
 }
@@ -134,11 +134,11 @@ if ($RunPipeline) {
 }
 
 # ---------- Email config from .env ----------
-$SMTP_HOST = $env:SMTP_HOST
-$SMTP_PORT = [int]($env:SMTP_PORT ? $env:SMTP_PORT : 587)
+$SMTP_HOST = if ($env:SMTP_HOST) { $env:SMTP_HOST } else { 'smtp.gmail.com' }
+$SMTP_PORT = if ($env:SMTP_PORT) { [int]$env:SMTP_PORT } else { 587 }
 $SMTP_USER = $env:SMTP_USER
 $SMTP_PASS = $env:SMTP_PASS
-$MAIL_FROM = $env:MAIL_FROM
+$MAIL_FROM = if ($env:MAIL_FROM) { $env:MAIL_FROM } else { $SMTP_USER }
 $MAIL_TO   = $env:MAIL_TO
 
 Write-Log "SMTP_HOST=$SMTP_HOST PORT=$SMTP_PORT USER=$SMTP_USER"
