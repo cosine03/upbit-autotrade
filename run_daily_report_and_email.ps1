@@ -212,9 +212,16 @@ $mail.IsBodyHtml       = $false
 
 # ★ 인코딩 강제: 제목/본문/헤더/첨부이름
 # (Send-ReportMail 함수 내부, $msg 생성된 뒤 바로 아래에 추가)
-$msg.BodyEncoding    = [System.Text.Encoding]::UTF8
-$msg.SubjectEncoding = [System.Text.Encoding]::UTF8
-$msg.HeadersEncoding = [System.Text.Encoding]::UTF8
+$mail.BodyEncoding    = [System.Text.Encoding]::UTF8
+$mail.SubjectEncoding = [System.Text.Encoding]::UTF8
+$mail.HeadersEncoding = [System.Text.Encoding]::UTF8
+
+# === ★ 여기서 UTF-8 강제 ★ ===
+# $enc = [System.Text.Encoding]::UTF8
+# $msg.BodyEncoding    = $enc
+# $msg.SubjectEncoding = $enc
+
+try { $msg.HeadersEncoding = $enc } catch { }  # 일부 환경에서만 지원
 
 if ($mail.PSObject.Properties.Name -contains 'HeadersEncoding') { $mail.HeadersEncoding = $utf8 }
 
