@@ -12,7 +12,7 @@ run_daily_report_and_email.ps1
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=you@gmail.com
-SMTP_PASS=app_password_here   # 앱 비밀번호 (일반 비번 X)
+SMTP_PASS=app_password_here    # 앱 비밀번호 (일반 비번 X)
 MAIL_FROM=you@gmail.com
 MAIL_TO=first@example.com,second@example.com
 #>
@@ -29,8 +29,9 @@ $ErrorActionPreference = "Stop"
 # ---------- Path & Date ----------
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
+
 $DATE = Get-Date -Format "yyyy-MM-dd"
-$DailyDir = Join-Path $Root "logs\daily\${DATE}_$TagHalf"
+$DailyDir   = Join-Path $Root "logs\daily\${DATE}_$TagHalf"
 $ReportsDir = Join-Path $Root "logs\reports"
 if (-not (Test-Path $ReportsDir)) { New-Item -ItemType Directory -Force -Path $ReportsDir | Out-Null }
 
@@ -38,10 +39,9 @@ if (-not (Test-Path $ReportsDir)) { New-Item -ItemType Directory -Force -Path $R
 $EmailLog = Join-Path $ReportsDir ("email_{0}_{1}.log" -f $DATE, $TagHalf)
 function Write-Log([string]$msg) {
   $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-  $line = "[{0}] {1}" -f $stamp, $msg
+  $line  = "[{0}] {1}" -f $stamp, $msg
   $line | Tee-Object -FilePath $EmailLog -Append
 }
-
 Write-Log "== RUN START == Root=$Root  Half=$TagHalf  ==="
 Write-Log "DATE            : $DATE"
 Write-Log "DailyDir        : $DailyDir"
@@ -49,35 +49,32 @@ Write-Log "DailyDir        : $DailyDir"
 # ---------- .env loader ----------
 $DotEnv = Join-Path $Root ".env"
 function Load-DotEnv($path) {
-# (기존 .env 로딩 루프를 아래처럼 교체)
-if (Test-Path -LiteralPath ".\.env") {
-  Get-Content ".\.env" | ForEach-Object {
-    $line = $_.Trim()
-    if (-not $line) { return }                 # 빈 줄 skip
-    if ($line -match '^\s*#') { return }       # 전체 주석 줄 skip
-
-    # (1) 라인 끝 주석 제거 (# 이후로 잘라냄)
-    if ($line.Contains('#')) {
-      $line = $line.Split('#')[0].Trim()
-      if (-not $line) { return }
+  if (Test-Path -LiteralPath $path) {
+    Get-Content $path | ForEach-Object {
+      $line = $_.Trim()
+      if (-not $line) { return }                   # 빈 줄 skip
+      if ($line -match '^\s*#') { return }         # 전체 주석 줄 skip
+      # (1) 라인 끝 주석 제거 (# 이후로 잘라냄)
+      if ($line.Contains('#')) {
+        $line = $line.Split('#')[0].Trim()
+        if (-not $line) { return }
+      }
+      # (2) key=value 파싱
+      $parts = $line.Split('=', 2)
+      if ($parts.Count -ne 2) { return }
+      $k = $parts[0].Trim()
+      $v = $parts[1].Trim()
+      # (3) 값 감싼 따옴표 제거
+      if (($v.StartsWith('"') -and $v.EndsWith('"')) -or
+          ($v.StartsWith("'") -and $v.EndsWith("'"))) {
+        $v = $v.Substring(1, $v.Length-2)
+      }
+      if ($k) { Set-Item -Path ("Env:{0}" -f $k) -Value $v }
     }
-
-    # (2) key=value 파싱
-    $parts = $line.Split('=',2)
-    if ($parts.Count -ne 2) { return }
-    $k = $parts[0].Trim()
-    $v = $parts[1].Trim()
-
-    # (3) 값에 감싼 따옴표 제거
-    if (($v.StartsWith('"') -and $v.EndsWith('"')) -or
-        ($v.StartsWith("'") -and $v.EndsWith("'"))) {
-      $v = $v.Substring(1, $v.Length-2)
-    }
-
-    if ($k) { Set-Item -Path ("Env:{0}" -f $k) -Value $v }
+    Write-Log ".env loaded."
+  } else {
+    Write-Log "[WARN] .env not found at $path"
   }
-}
-  Write-Log ".env loaded."
 }
 Load-DotEnv $DotEnv
 
@@ -104,20 +101,10 @@ Write-Log "MergedSummary   : $MergedSummary"
 if ($RunPipeline) {
   try {
     Write-Log "[PIPE] start"
-    # (1) 일일 폴더 준비
+
     if (-not (Test-Path $DailyDir)) { New-Item -ItemType Directory -Force -Path $DailyDir | Out-Null }
 
-    # (2) 시그널 분리/가공 (이미 별도 ps1이 있다면 그걸 호출해도 됨)
-    # 예시: 기존에 사용하던 Python/PS 파이프라인 호출
-    # python .\label_events_side.py "$SignalsTV" --out "$DailyDir\signals_labeled.csv"
-    # python .\filter_breakout_only.py "$DailyDir\signals_labeled.csv" --out "$SignalsBreakout" --dist-max 0.000188
-    # python .\filter_boxin_linebreak.py "$DailyDir\signals_labeled.csv" --out "$SignalsBoxLine" --dist-max 0.000188
-
-    # (3) 백테스트 실행 (기존에 쓰던 커맨드 호출)
-    # python .\backtest_tv_events_mp.py "$SignalsBreakout"  --timeframe 15m --expiries 0.5h,1h,2h --tp 1.75 --sl 0.7 --fee 0.001 --entry prev_close --dist-max 0.000188 --outdir "$BtDirBreakout"
-    # python .\backtest_tv_events_mp.py "$SignalsBoxLine"   --timeframe 15m --expiries 0.5h,1h,2h --tp 1.75 --sl 0.7 --fee 0.001 --entry prev_close --dist-max 0.000188 --outdir "$BtDirBoxLine"
-
-    # (4) 요약 병합 (PowerShell 내에서 간단히 합치기)
+    # (여기에 신호 분리/백테스트 호출을 넣을 수 있음. 현재는 요약 병합만 수행)
     if ((Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
       $b = Import-Csv $BreakoutSummary
       $l = Import-Csv $BoxLineSummary
@@ -128,12 +115,13 @@ if ($RunPipeline) {
     } else {
       Write-Log "[PIPE][WARN] summary files missing; skip merge."
     }
+
     Write-Log "[PIPE] done"
   } catch {
     Write-Log "[PIPE][ERROR] $($_.Exception.Message)"
   }
 } else {
-  # 파이프라인을 돌리지 않는 경우: merged 가 없으면 만들어 준다(가능한 경우)
+  # 파이프라인을 돌리지 않는 경우: merged 없으면 만들어 준다(가능한 경우)
   if ((-not (Test-Path $MergedSummary)) -and (Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
     try {
       $b = Import-Csv $BreakoutSummary
@@ -160,7 +148,7 @@ Write-Log "SMTP_HOST=$SMTP_HOST PORT=$SMTP_PORT USER=$SMTP_USER"
 Write-Log "MAIL_FROM=$MAIL_FROM"
 Write-Log "MAIL_TO=$MAIL_TO"
 
-# ---------- Compose email ----------
+# ---------- Compose subject/body/attachments ----------
 $subject = "[Autotrade] Daily Report $DATE $TagHalf"
 $body = @"
 자동 생성 리포트 ($DATE $TagHalf)
@@ -174,72 +162,99 @@ $body = @"
 "@
 
 # 수신자 배열 정리(콤마/세미콜론 구분 허용)
-$toList = @()
+$ToList = @()
 if ($MAIL_TO) {
   $MAIL_TO.Split(',;') | ForEach-Object {
     $addr = $_.Trim()
-    if ($addr) { $toList += $addr }
+    if ($addr) { $ToList += $addr }
   }
+}
+if (-not $ToList -or $ToList.Count -eq 0) {
+  Write-Log "[MAIL][ERROR] MAIL_TO empty."
+  throw "MAIL_TO empty"
 }
 
 # 첨부 파일 존재 확인
-$attachments = @()
+$Attachments = @()
 foreach ($p in @($MergedSummary, $BreakoutSummary, $BoxLineSummary)) {
   if (Test-Path $p) {
-    $attachments += (Resolve-Path $p).Path
+    $Attachments += (Resolve-Path $p).Path
   } else {
     Write-Log "[ATTACH][WARN] not found -> $p"
   }
 }
 
-# ---------- Send via System.Net.Mail ----------
-# 1) 기본 변수
-$DATE    = Get-Date -Format 'yyyy-MM-dd'
-$subject = "[Autotrade Daily Report] $DATE $TagHalf"
-$body    = "자동 생성된 리포트 첨부 (테스트)."
+# ---------- Mail sender (System.Net.Mail; UTF-8 강제) ----------
+function Send-ReportMail {
+  param(
+    [Parameter(Mandatory)][string]$Subject,
+    [Parameter(Mandatory)][string]$Body,
+    [Parameter(Mandatory)][string[]]$ToList,
+    [string]$From,
+    [string]$SmtpHost,
+    [int]$SmtpPort = 587,
+    [string]$User = $null,
+    [string]$Pass = $null,
+    [string[]]$Attachments = @(),
+    [string]$LogPath = $null
+  )
 
-# 2) 최근 merged summary 하나 첨부 예시
-$attach  = Get-ChildItem -Path .\logs\daily -Recurse -Filter bt_stats_summary_merged*.csv |
-             Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+  $enc = [System.Text.Encoding]::UTF8
 
-# 3) UTF-8 메일 전송 (System.Net.Mail)
-$mail = New-Object System.Net.Mail.MailMessage
-$mail.From = $env:MAIL_FROM
-$env:MAIL_TO.Split(',') | ForEach-Object { $mail.To.Add($_.Trim()) }
-$mail.Subject          = $subject
-$mail.Body             = $body
-$mail.IsBodyHtml       = $false
+  $msg = New-Object System.Net.Mail.MailMessage
+  if ($From) { $msg.From = $From } else { throw "MAIL_FROM is empty" }
+  foreach ($to in $ToList) { [void]$msg.To.Add($to) }
+  $msg.Subject        = $Subject
+  $msg.Body           = $Body
+  $msg.IsBodyHtml     = $false
+  $msg.BodyEncoding   = $enc
+  $msg.SubjectEncoding= $enc
+  if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding') { $msg.HeadersEncoding = $enc }
 
-# ★ 인코딩 강제: 제목/본문/헤더/첨부이름
-# (Send-ReportMail 함수 내부, $msg 생성된 뒤 바로 아래에 추가)
-$mail.BodyEncoding    = [System.Text.Encoding]::UTF8
-$mail.SubjectEncoding = [System.Text.Encoding]::UTF8
-$mail.HeadersEncoding = [System.Text.Encoding]::UTF8
+  foreach ($p in $Attachments) {
+    if ($p -and (Test-Path -LiteralPath $p)) {
+      $att = New-Object System.Net.Mail.Attachment($p)
+      if ($att.PSObject.Properties.Name -contains 'NameEncoding') { $att.NameEncoding = $enc }
+      $msg.Attachments.Add($att) | Out-Null
+    }
+  }
 
-# === ★ 여기서 UTF-8 강제 ★ ===
-$enc = [System.Text.Encoding]::UTF8
-$msg.BodyEncoding    = $enc
-$msg.SubjectEncoding = $enc
+  $client = New-Object System.Net.Mail.SmtpClient($SmtpHost, $SmtpPort)
+  $client.EnableSsl = $true
+  if ($User -and $Pass) {
+    $client.Credentials = New-Object System.Net.NetworkCredential($User, $Pass)
+  }
 
-try { $msg.HeadersEncoding = $enc } catch { }  # 일부 환경에서만 지원
-
-if ($mail.PSObject.Properties.Name -contains 'HeadersEncoding') { $mail.HeadersEncoding = $utf8 }
-
-if ($attach) {
-  $att = New-Object System.Net.Mail.Attachment($attach)
-  if ($att.PSObject.Properties.Name -contains 'NameEncoding') { $att.NameEncoding = $utf8 }
-  $mail.Attachments.Add($att)
+  try {
+    $client.Send($msg)
+    if ($LogPath) { "[MAIL][OK] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Subject=$Subject" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
+  } catch {
+    $err = $_.Exception.Message
+    if ($LogPath) { "[MAIL][ERROR] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $err" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
+    throw
+  } finally {
+    $msg.Dispose()
+    $client.Dispose()
+  }
 }
 
-$smtp = New-Object System.Net.Mail.SmtpClient($env:SMTP_HOST, [int]$env:SMTP_PORT)
-$smtp.EnableSsl  = $true
-$smtp.Credentials = New-Object System.Net.NetworkCredential($env:SMTP_USER, $env:SMTP_PASS)
+# ---------- Send ----------
+try {
+  Send-ReportMail `
+    -Subject $subject `
+    -Body $body `
+    -ToList $ToList `
+    -From $MAIL_FROM `
+    -SmtpHost $SMTP_HOST `
+    -SmtpPort $SMTP_PORT `
+    -User $SMTP_USER `
+    -Pass $SMTP_PASS `
+    -Attachments $Attachments `
+    -LogPath $EmailLog
 
-$smtp.Send($mail)
-
-# 정리
-$mail.Dispose()
-$smtp.Dispose()
-"OK - 메일 전송 완료"
-
-exit 0
+  Write-Log "== DONE =="
+  exit 0
+} catch {
+  Write-Log "[FATAL] $($_.Exception.Message)"
+  exit 1
+}
