@@ -230,7 +230,11 @@ $body = @"
 # ===== 메일 발송 함수 (UTF-8 강제) =====
 $enc = [System.Text.Encoding]::UTF8
 $msg = New-Object System.Net.Mail.MailMessage
-$msg.From = $From
+if ($From) { 
+    $msg.From = $From 
+} else { 
+    throw "MAIL_FROM is empty" 
+}
 foreach ($to in $ToList) { $msg.To.Add($to) }
 
 $msg.Subject         = $Subject
