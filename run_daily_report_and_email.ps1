@@ -204,17 +204,28 @@ function Send-ReportMail {
   $msg = New-Object System.Net.Mail.MailMessage
   if ($From) { $msg.From = $From } else { throw "MAIL_FROM is empty" }
   foreach ($to in $ToList) { [void]$msg.To.Add($to) }
-  $msg.Subject        = $Subject
-  $msg.Body           = $Body
-  $msg.IsBodyHtml     = $false
-  $msg.BodyEncoding   = $enc
-  $msg.SubjectEncoding= $enc
+  $msg.Subject            = $Subject
+  $msg.SubjectEncoding    = $enc
+  $msg.IsBodyHtml         = $false
+
+  # --- 핵심: 본문을 AlternateView로 UTF-8/Quoted-Printable 지정 ---
+  $alt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($Body, $enc, "text/plain")
+  $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::QuotedPrintable
+  $msg.AlternateViews.Clear()
+  $msg.AlternateViews.Add($alt)
+
+  # (호환용으로 Body에도 세팅하되 인코딩 강제)
+  $msg.Body         = $Body
+  $msg.BodyEncoding = $enc
   if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding') { $msg.HeadersEncoding = $enc }
 
+  # 첨부: 파일명 인코딩
   foreach ($p in $Attachments) {
     if ($p -and (Test-Path -LiteralPath $p)) {
       $att = New-Object System.Net.Mail.Attachment($p)
-      if ($att.PSObject.Properties.Name -contains 'NameEncoding') { $att.NameEncoding = $enc }
+      if ($att.PSObject.Properties.Name -contains 'NameEncoding') {
+        $att.NameEncoding = $enc
+      }
       $msg.Attachments.Add($att) | Out-Null
     }
   }
