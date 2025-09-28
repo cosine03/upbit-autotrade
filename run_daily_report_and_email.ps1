@@ -195,7 +195,6 @@ foreach ($p in @($MergedSummary, $BreakoutSummary, $BoxLineSummary)) {
 # ---------- Send via System.Net.Mail ----------
 # 1) 기본 변수
 $DATE    = Get-Date -Format 'yyyy-MM-dd'
-$TagHalf = "TEST"
 $subject = "[Autotrade Daily Report] $DATE $TagHalf"
 $body    = "자동 생성된 리포트 첨부 (테스트)."
 
