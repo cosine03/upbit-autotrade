@@ -1,21 +1,3 @@
-<# 
-run_daily_report_and_email.ps1
-- AM/PM별 일일 리포트 생성(옵션) + 메일 발송(UTF-8, HTML)
-- 메일 전송 로그: logs\reports\email_YYYY-MM-DD_{AM|PM}.log
-- 첨부: 
-  1) bt_stats_summary_merged_{AM|PM}.csv
-  2) bt_breakout_only\bt_tv_events_stats_summary.csv
-  3) bt_boxin_linebreak\bt_tv_events_stats_summary.csv
-
-.env 예:
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=you@gmail.com
-SMTP_PASS=app_password_here        # 앱 비밀번호
-MAIL_FROM=you@gmail.com
-MAIL_TO=a@ex.com,b@ex.com
-#>
-
 param(
   [ValidateSet("AM","PM")]
   [string]$TagHalf = "AM",
@@ -35,123 +17,67 @@ if (-not (Test-Path $ReportsDir)) { New-Item -ItemType Directory -Force -Path $R
 
 # ---------- Logging ----------
 $EmailLog = Join-Path $ReportsDir ("email_{0}_{1}.log" -f $DATE, $TagHalf)
-function Write-Log([string]$msg) {
-  $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-  $line  = "[{0}] {1}" -f $stamp, $msg
-  $line | Tee-Object -FilePath $EmailLog -Append
+function Write-Log([string]$msg){
+  $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  "[{0}] {1}" -f $stamp,$msg | Tee-Object -FilePath $EmailLog -Append
 }
-Write-Log "== RUN START == Root=$Root  Half=$TagHalf =="
+Write-Log "== RUN START == Root=$Root Half=$TagHalf =="
 
 # ---------- .env loader ----------
-$DotEnv = Join-Path $Root ".env"
-function Load-DotEnv($path) {
-  if (Test-Path -LiteralPath $path) {
-    Get-Content $path | ForEach-Object {
+function Load-DotEnv([string]$path){
+  if (Test-Path -LiteralPath $path){
+    Get-Content $path | ForEach-Object{
       $line = $_.Trim()
-      if (-not $line) { return }
-      if ($line -match '^\s*#') { return }
-      if ($line.Contains('#')) { $line = $line.Split('#')[0].Trim(); if (-not $line) { return } }
-      $parts = $line.Split('=',2)
-      if ($parts.Count -ne 2) { return }
-      $k = $parts[0].Trim(); $v = $parts[1].Trim()
-      if (($v.StartsWith('"') -and $v.EndsWith('"')) -or ($v.StartsWith("'") -and $v.EndsWith("'"))) {
-        $v = $v.Substring(1, $v.Length-2)
+      if (-not $line -or $line -match '^\s*#') { return }
+      if ($line.Contains('#')) { $line = $line.Split('#')[0].Trim(); if (-not $line){ return } }
+      $kv = $line.Split('=',2)
+      if ($kv.Count -ne 2){ return }
+      $k = $kv[0].Trim(); $v = $kv[1].Trim()
+      if (($v.StartsWith('"') -and $v.EndsWith('"')) -or ($v.StartsWith("'") -and $v.EndsWith("'"))){
+        $v = $v.Substring(1,$v.Length-2)
       }
-      if ($k) { Set-Item -Path ("Env:{0}" -f $k) -Value $v }
+      if ($k){ Set-Item -Path ("Env:{0}" -f $k) -Value $v }
     }
     Write-Log ".env loaded."
   } else {
-    Write-Log "[WARN] .env not found at $path"
+    Write-Log "[WARN] .env not found: $path"
   }
 }
-Load-DotEnv $DotEnv
+Load-DotEnv (Join-Path $Root ".env")
 
-# ---------- Key files ----------
-$SignalsTV        = Join-Path $Root "logs\signals_tv.csv"
-$SignalsBreakout  = Join-Path $DailyDir "signals_breakout_only.csv"
-$SignalsBoxLine   = Join-Path $DailyDir "signals_boxin_linebreak.csv"
-$DynParams        = Join-Path $DailyDir "dynamic_params.json"
-$BtDirBreakout    = Join-Path $DailyDir "bt_breakout_only"
-$BtDirBoxLine     = Join-Path $DailyDir "bt_boxin_linebreak"
-$BreakoutSummary  = Join-Path $BtDirBreakout "bt_tv_events_stats_summary.csv"
-$BoxLineSummary   = Join-Path $BtDirBoxLine  "bt_tv_events_stats_summary.csv"
-$MergedSummary    = Join-Path $DailyDir ("bt_stats_summary_merged_{0}.csv" -f $TagHalf)
-$TradesMergedCsv  = Join-Path $DailyDir ("bt_trades_merged_dedup_{0}.csv" -f $TagHalf) # 선택: dedup 결과 저장
+# ---------- Important files ----------
+$BtDirBreakout   = Join-Path $DailyDir "bt_breakout_only"
+$BtDirBoxLine    = Join-Path $DailyDir "bt_boxin_linebreak"
+$BreakoutSummary = Join-Path $BtDirBreakout "bt_tv_events_stats_summary.csv"
+$BoxLineSummary  = Join-Path $BtDirBoxLine  "bt_tv_events_stats_summary.csv"
+$MergedSummary   = Join-Path $DailyDir ("bt_stats_summary_merged_{0}.csv" -f $TagHalf)
 
-Write-Log "DailyDir       : $DailyDir"
-Write-Log "MergedSummary  : $MergedSummary"
-
-# ---------- Optional pipeline (merge + dedup) ----------
-function Merge-And-Dedup {
-  param(
-    [string]$BreakoutSummaryCsv,
-    [string]$BoxLineSummaryCsv,
-    [string]$MergedOutCsv
-  )
-  if ((Test-Path $BreakoutSummaryCsv) -and (Test-Path $BoxLineSummaryCsv)) {
-    $b = Import-Csv $BreakoutSummaryCsv
-    $l = Import-Csv $BoxLineSummaryCsv
+# ---------- (Optional) Merge summaries ----------
+function Merge-Summaries {
+  param([string]$BreakoutCsv,[string]$BoxLineCsv,[string]$OutCsv)
+  if ((Test-Path $BreakoutCsv) -and (Test-Path $BoxLineCsv)){
+    $b = Import-Csv $BreakoutCsv
+    $l = Import-Csv $BoxLineCsv
     $b | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "breakout_only" -Force }
     $l | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "boxin_linebreak" -Force }
-    ($b + $l) | Export-Csv -NoTypeInformation -Encoding UTF8 $MergedOutCsv
-    Write-Log "merged summary saved -> $MergedOutCsv"
+    ($b + $l) | Export-Csv -NoTypeInformation -Encoding UTF8 $OutCsv
+    Write-Log "merged summary saved -> $OutCsv"
   } else {
-    Write-Log "[PIPE][WARN] summary files missing; skip merge."
+    Write-Log "[PIPE][WARN] missing summary -> skip merge"
   }
 }
 
-# (필요 시) trades dedup 유틸: 동일 symbol/event/expiry/entry_ts/side 기준 중복 제거
-function Dedup-Trades {
-  param(
-    [string[]]$TradeCsvPaths,
-    [string]$OutCsv
-  )
-  $all = @()
-  foreach ($p in $TradeCsvPaths) {
-    if (Test-Path $p) { $all += (Import-Csv $p) }
-  }
-  if (-not $all -or $all.Count -eq 0) { return }
-  $keys = @{}
-  $dedup = New-Object System.Collections.Generic.List[object]
-  foreach ($row in $all) {
-    $k = "{0}|{1}|{2}|{3}|{4}" -f $row.symbol,$row.event,$row.expiry_h,$row.entry_ts,$row.side
-    if (-not $keys.ContainsKey($k)) { $keys[$k] = $true; $dedup.Add($row) }
-  }
-  $dedup | Export-Csv -NoTypeInformation -Encoding UTF8 $OutCsv
-  Write-Log "dedup trades saved -> $OutCsv (in=${all.Count}, out=${dedup.Count})"
-}
-
-if ($RunPipeline) {
-  try {
-    Write-Log "[PIPE] start"
-    if (-not (Test-Path $DailyDir)) { New-Item -ItemType Directory -Force -Path $DailyDir | Out-Null }
-
-    # (여기: 신호 분리/백테스트 실행이 필요하면 추가 호출)
-    # 예시로 summary 병합만 수행
-    Merge-And-Dedup -BreakoutSummaryCsv $BreakoutSummary -BoxLineSummaryCsv $BoxLineSummary -MergedOutCsv $MergedSummary
-
-    # (선택) 트레이드 dedup: bt_*_trades.csv 찾기
-    $tradeCsvs = @()
-    $btBreakTrades = Join-Path $BtDirBreakout "bt_tv_events_trades.csv"
-    $btBoxTrades   = Join-Path $BtDirBoxLine  "bt_tv_events_trades.csv"
-    if (Test-Path $btBreakTrades) { $tradeCsvs += $btBreakTrades }
-    if (Test-Path $btBoxTrades)   { $tradeCsvs += $btBoxTrades }
-    if ($tradeCsvs.Count -gt 0) {
-      Dedup-Trades -TradeCsvPaths $tradeCsvs -OutCsv $TradesMergedCsv
-    }
-
-    Write-Log "[PIPE] done"
-  } catch {
-    Write-Log "[PIPE][ERROR] $($_.Exception.Message)"
-  }
+if ($RunPipeline){
+  if (-not (Test-Path $DailyDir)){ New-Item -ItemType Directory -Force -Path $DailyDir | Out-Null }
+  Merge-Summaries -BreakoutCsv $BreakoutSummary -BoxLineCsv $BoxLineSummary -OutCsv $MergedSummary
 } else {
-  if ((-not (Test-Path $MergedSummary)) -and (Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
-    Merge-And-Dedup -BreakoutSummaryCsv $BreakoutSummary -BoxLineSummaryCsv $BoxLineSummary -MergedOutCsv $MergedSummary
+  if ((-not (Test-Path $MergedSummary)) -and (Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)){
+    Merge-Summaries -BreakoutCsv $BreakoutSummary -BoxLineCsv $BoxLineSummary -OutCsv $MergedSummary
   }
 }
 
-# ---------- Email config ----------
-$SMTP_HOST = if ($env:SMTP_HOST) { $env:SMTP_HOST } else { 'smtp.gmail.com' }
+# ---------- SMTP config ----------
+$SMTP_HOST = $env:SMTP_HOST; if (-not $SMTP_HOST){ $SMTP_HOST = 'smtp.gmail.com' }
 $SMTP_PORT = if ($env:SMTP_PORT) { [int]$env:SMTP_PORT } else { 587 }
 $SMTP_USER = $env:SMTP_USER
 $SMTP_PASS = $env:SMTP_PASS
@@ -162,39 +88,34 @@ Write-Log "SMTP_HOST=$SMTP_HOST PORT=$SMTP_PORT USER=$SMTP_USER"
 Write-Log "MAIL_FROM=$MAIL_FROM"
 Write-Log "MAIL_TO=$MAIL_TO"
 
-# ---------- Recipients & Attachments ----------
-# 수신자 배열 정리(콤마/세미콜론 허용)
+# ---------- Recipients / Attachments ----------
 $ToList = @()
-if ($MAIL_TO) {
-  $MAIL_TO.Split(',;') | ForEach-Object { $addr = $_.Trim(); if ($addr) { $ToList += $addr } }
-}
-if (-not $ToList -or $ToList.Count -eq 0) { Write-Log "[MAIL][ERROR] MAIL_TO empty."; throw "MAIL_TO empty" }
+if ($MAIL_TO){ $MAIL_TO.Split(',;') | % { $a=$_.Trim(); if($a){ $ToList+=$a } } }
+if (-not $ToList){ throw "MAIL_TO empty" }
 
 $Attachments = @()
-foreach ($p in @($MergedSummary, $BreakoutSummary, $BoxLineSummary)) {
-  if (Test-Path $p) { $Attachments += (Resolve-Path $p).Path } else { Write-Log "[ATTACH][WARN] not found -> $p" }
+foreach($p in @($MergedSummary,$BreakoutSummary,$BoxLineSummary)){
+  if (Test-Path $p){ $Attachments += (Resolve-Path $p).Path } else { Write-Log "[ATTACH][WARN] missing -> $p" }
 }
-if (Test-Path $TradesMergedCsv) { $Attachments += (Resolve-Path $TradesMergedCsv).Path }
 
-# ---------- HTML body (UTF-8, 테이블 포함) ----------
-# 테이블 미리뷰: merged summary 상위 10행
+# ---------- HTML helpers ----------
+Add-Type -AssemblyName System.Web | Out-Null
 function Get-TopHtmlTable {
-  param([string]$CsvPath, [int]$Top = 10)
+  param([string]$CsvPath,[int]$Top=10)
   if (-not (Test-Path $CsvPath)) { return "<p>요약 파일이 없습니다: $([System.Web.HttpUtility]::HtmlEncode($CsvPath))</p>" }
   $rows = Import-Csv $CsvPath | Select-Object -First $Top
-  if (-not $rows) { return "<p>표시할 데이터가 없습니다.</p>" }
-
+  if (-not $rows){ return "<p>표시할 데이터가 없습니다.</p>" }
   $cols = $rows[0].PSObject.Properties.Name
   $sb = New-Object System.Text.StringBuilder
-  [void]$sb.AppendLine('<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;font-family:Segoe UI,Arial,sans-serif;font-size:12px;">')
+  [void]$sb.AppendLine('<table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse;font-family:Segoe UI,Arial,sans-serif;font-size:12px;">')
   [void]$sb.AppendLine('<thead><tr>')
-  foreach ($c in $cols) { [void]$sb.AppendLine("<th style='background:#f2f2f2;text-align:left;'>$([System.Web.HttpUtility]::HtmlEncode($c))</th>") }
+  foreach($c in $cols){ [void]$sb.AppendLine("<th style='background:#f2f2f2;text-align:left;'>$([System.Web.HttpUtility]::HtmlEncode($c))</th>") }
   [void]$sb.AppendLine('</tr></thead><tbody>')
-  foreach ($r in $rows) {
+  foreach($r in $rows){
     [void]$sb.AppendLine('<tr>')
-    foreach ($c in $cols) {
-      $val = $r.$c
-      [void]$sb.AppendLine("<td>$([System.Web.HttpUtility]::HtmlEncode([string]$val))</td>")
+    foreach($c in $cols){
+      $val = [string]$r.$c
+      [void]$sb.AppendLine("<td>$([System.Web.HttpUtility]::HtmlEncode($val))</td>")
     }
     [void]$sb.AppendLine('</tr>')
   }
@@ -202,6 +123,7 @@ function Get-TopHtmlTable {
   $sb.ToString()
 }
 
+# ---------- Build subject/body ----------
 $Subject = "[Autotrade] Daily Report $DATE $TagHalf"
 $TopTableHtml = Get-TopHtmlTable -CsvPath $MergedSummary -Top 10
 $BodyHtml = @"
@@ -218,7 +140,6 @@ $BodyHtml = @"
     <li>$(Split-Path $MergedSummary -Leaf)</li>
     <li>$(Split-Path $BreakoutSummary -Leaf)</li>
     <li>$(Split-Path $BoxLineSummary -Leaf)</li>
-    $(if (Test-Path $TradesMergedCsv) { "<li>$(Split-Path $TradesMergedCsv -Leaf)</li>" })
   </ul>
   <h3>요약 미리보기 (상위 10행)</h3>
   $TopTableHtml
@@ -227,7 +148,7 @@ $BodyHtml = @"
 </html>
 "@
 
-# ---------- Mail sender (System.Net.Mail; UTF-8 + HTML) ----------
+# ---------- Sender (UTF-8 + Base64) ----------
 function Send-ReportMail {
   param(
     [Parameter(Mandatory)][string]$Subject,
@@ -243,67 +164,52 @@ function Send-ReportMail {
   )
 
   $enc = [System.Text.Encoding]::UTF8
-
   $msg = New-Object System.Net.Mail.MailMessage
   $msg.From = $From
-  foreach ($to in $ToList) { [void]$msg.To.Add($to) }
+  foreach($to in $ToList){ [void]$msg.To.Add($to) }
+  $msg.Subject         = $Subject
+  $msg.SubjectEncoding = $enc
+  $msg.IsBodyHtml      = $true
 
-  $msg.Subject          = $Subject
-  $msg.SubjectEncoding  = $enc
-  $msg.IsBodyHtml       = $true
-
-  # HTML AlternateView (UTF-8 + Quoted-Printable)
+  # HTML AlternateView (UTF-8 + Base64) -> 일부 국내 수신자에서 QP보다 안정적
   $alt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($BodyHtml, $enc, "text/html")
-  $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::QuotedPrintable
+  $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::Base64
   $msg.AlternateViews.Add($alt)
-
-  # 호환용 Body에도 HTML 세팅 + 인코딩 강제
   $msg.Body         = $BodyHtml
   $msg.BodyEncoding = $enc
-  if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding') { $msg.HeadersEncoding = $enc }
+  if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding'){ $msg.HeadersEncoding = $enc }
 
-  foreach ($p in $Attachments) {
-    if ($p -and (Test-Path -LiteralPath $p)) {
+  foreach($p in $Attachments){
+    if ($p -and (Test-Path -LiteralPath $p)){
       $att = New-Object System.Net.Mail.Attachment($p)
-      if ($att.PSObject.Properties.Name -contains 'NameEncoding') { $att.NameEncoding = $enc }
+      if ($att.PSObject.Properties.Name -contains 'NameEncoding'){ $att.NameEncoding = $enc }
       $msg.Attachments.Add($att) | Out-Null
     }
   }
 
-  $client = New-Object System.Net.Mail.SmtpClient($SmtpHost, $SmtpPort)
+  $client = New-Object System.Net.Mail.SmtpClient($SmtpHost,$SmtpPort)
   $client.EnableSsl = $true
-  if ($User -and $Pass) { $client.Credentials = New-Object System.Net.NetworkCredential($User, $Pass) }
+  if ($User -and $Pass){ $client.Credentials = New-Object System.Net.NetworkCredential($User,$Pass) }
 
-  try {
+  try{
     $client.Send($msg)
-    if ($LogPath) { "[MAIL][OK] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Subject=$Subject" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
+    if ($LogPath){ "[MAIL][OK] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Subject=$Subject" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
   } catch {
     $err = $_.Exception.Message
-    if ($LogPath) { "[MAIL][ERROR] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $err" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
+    if ($LogPath){ "[MAIL][ERROR] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $err" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
     throw
   } finally {
-    $msg.Dispose()
-    $client.Dispose()
+    $msg.Dispose(); $client.Dispose()
   }
 }
 
 # ---------- Send ----------
-try {
-  Send-ReportMail `
-    -Subject  $Subject `
-    -BodyHtml $BodyHtml `
-    -ToList   $ToList `
-    -From     $MAIL_FROM `
-    -SmtpHost $SMTP_HOST `
-    -SmtpPort $SMTP_PORT `
-    -User     $SMTP_USER `
-    -Pass     $SMTP_PASS `
-    -Attachments $Attachments `
-    -LogPath  $EmailLog
-
+try{
+  Send-ReportMail -Subject $Subject -BodyHtml $BodyHtml -ToList $ToList `
+    -From $MAIL_FROM -SmtpHost $SMTP_HOST -SmtpPort $SMTP_PORT `
+    -User $SMTP_USER -Pass $SMTP_PASS -Attachments $Attachments -LogPath $EmailLog
   Write-Log "== DONE =="
   exit 0
 } catch {
-  Write-Log "[FATAL] $($_.Exception.Message)"
-  exit 1
+  Write-Log "[FATAL] $($_.Exception.Message)"; exit 1
 }
