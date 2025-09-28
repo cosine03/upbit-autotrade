@@ -1,3 +1,12 @@
+# 스크립트 위치 기준으로 이동
+Set-Location -Path (Split-Path -Parent $MyInvocation.MyCommand.Definition)
+
+# reports 폴더 확인 후 없으면 생성
+$ReportDir = Join-Path -Path (Get-Location) -ChildPath "logs\report"
+if (-not (Test-Path $ReportDir)) {
+    New-Item -ItemType Directory -Force -Path $ReportDir | Out-Null
+}
+
 param(
   [ValidateSet('AM','PM')]
   [string]$TagHalf = 'AM',
