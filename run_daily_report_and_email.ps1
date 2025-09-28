@@ -148,14 +148,14 @@ $BodyHtml = @"
 </html>
 "@
 
-# ---------- Sender (UTF-8 + Base64) ----------
+# ---------- Mail sender (System.Net.Mail; UTF-8 + HTML Base64) ----------
 function Send-ReportMail {
   param(
     [Parameter(Mandatory)][string]$Subject,
     [Parameter(Mandatory)][string]$BodyHtml,
     [Parameter(Mandatory)][string[]]$ToList,
-    [Parameter(Mandatory)][string]$From,
-    [Parameter(Mandatory)][string]$SmtpHost,
+    [string]$From,
+    [string]$SmtpHost,
     [int]$SmtpPort = 587,
     [string]$User = $null,
     [string]$Pass = $null,
@@ -164,52 +164,72 @@ function Send-ReportMail {
   )
 
   $enc = [System.Text.Encoding]::UTF8
-  $msg = New-Object System.Net.Mail.MailMessage
-  $msg.From = $From
-  foreach($to in $ToList){ [void]$msg.To.Add($to) }
-  $msg.Subject         = $Subject
-  $msg.SubjectEncoding = $enc
-  $msg.IsBodyHtml      = $true
 
-  # HTML AlternateView (UTF-8 + Base64) -> 일부 국내 수신자에서 QP보다 안정적
+  # 1) 메시지 생성
+  $msg = New-Object System.Net.Mail.MailMessage
+  if (-not $From) { throw "MAIL_FROM is empty" }
+  $msg.From = $From
+  foreach ($to in $ToList) { [void]$msg.To.Add($to) }
+
+  # 2) 제목/헤더 인코딩
+  $msg.Subject = $Subject
+  $msg.SubjectEncoding = $enc
+  if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding') { $msg.HeadersEncoding = $enc }
+
+  # 3) HTML 본문 (AlternateView + Base64)
   $alt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($BodyHtml, $enc, "text/html")
   $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::Base64
+  $msg.AlternateViews.Clear()
   $msg.AlternateViews.Add($alt)
-  $msg.Body         = $BodyHtml
+  # 호환용(일부 클라이언트): Body/BodyEncoding도 세팅
+  $msg.IsBodyHtml = $true
+  $msg.Body        = $BodyHtml
   $msg.BodyEncoding = $enc
-  if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding'){ $msg.HeadersEncoding = $enc }
 
-  foreach($p in $Attachments){
-    if ($p -and (Test-Path -LiteralPath $p)){
+  # 4) 첨부 (파일명 UTF-8)
+  foreach ($p in $Attachments) {
+    if ($p -and (Test-Path -LiteralPath $p)) {
       $att = New-Object System.Net.Mail.Attachment($p)
-      if ($att.PSObject.Properties.Name -contains 'NameEncoding'){ $att.NameEncoding = $enc }
+      if ($att.PSObject.Properties.Name -contains 'NameEncoding') { $att.NameEncoding = $enc }
       $msg.Attachments.Add($att) | Out-Null
     }
   }
 
-  $client = New-Object System.Net.Mail.SmtpClient($SmtpHost,$SmtpPort)
+  # 5) SMTP
+  $client = New-Object System.Net.Mail.SmtpClient($SmtpHost, $SmtpPort)
   $client.EnableSsl = $true
-  if ($User -and $Pass){ $client.Credentials = New-Object System.Net.NetworkCredential($User,$Pass) }
+  if ($User -and $Pass) { $client.Credentials = New-Object System.Net.NetworkCredential($User, $Pass) }
 
-  try{
+  try {
     $client.Send($msg)
-    if ($LogPath){ "[MAIL][OK] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Subject=$Subject" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
+    if ($LogPath) { "[MAIL][OK] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Subject=$Subject" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
   } catch {
     $err = $_.Exception.Message
-    if ($LogPath){ "[MAIL][ERROR] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $err" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
+    if ($LogPath) { "[MAIL][ERROR] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $err" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
     throw
   } finally {
-    $msg.Dispose(); $client.Dispose()
+    $msg.Dispose()
+    $client.Dispose()
   }
 }
 
 # ---------- Send ----------
-try{
-  Send-ReportMail -Subject $Subject -BodyHtml $BodyHtml -ToList $ToList `
-    -From $MAIL_FROM -SmtpHost $SMTP_HOST -SmtpPort $SMTP_PORT `
-    -User $SMTP_USER -Pass $SMTP_PASS -Attachments $Attachments -LogPath $EmailLog
+try {
+  Send-ReportMail `
+    -Subject $Subject `
+    -BodyHtml $BodyHtml `
+    -ToList $ToList `
+    -From $MAIL_FROM `
+    -SmtpHost $SMTP_HOST `
+    -SmtpPort $SMTP_PORT `
+    -User $SMTP_USER `
+    -Pass $SMTP_PASS `
+    -Attachments $Attachments `
+    -LogPath $EmailLog
+
   Write-Log "== DONE =="
   exit 0
 } catch {
-  Write-Log "[FATAL] $($_.Exception.Message)"; exit 1
+  Write-Log "[FATAL] $($_.Exception.Message)"
+  exit 1
 }
