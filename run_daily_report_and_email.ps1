@@ -228,46 +228,46 @@ $body = @"
 "@
 
 # ===== 메일 발송 함수 (UTF-8 강제) =====
-function Send-ReportMail {
-  param(
-    [string]$Subject, [string]$Body, [string[]]$ToList,
-    [string]$From, [string]$SmtpHost, [int]$SmtpPort,
-    [string]$User, [string]$Pass, [string[]]$Attachments, [string]$LogPath
-  )
-  $enc = [System.Text.Encoding]::UTF8
-  $msg = New-Object System.Net.Mail.MailMessage
-  $msg.From = $From
-  foreach ($to in $ToList) { $msg.To.Add($to) }
-  $msg.Subject         = $Subject
-  $msg.SubjectEncoding = $enc
-  $msg.IsBodyHtml      = $true
-  $msg.BodyEncoding    = $enc
-  $msg.Body            = $Body
-  if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding') { $msg.HeadersEncoding = $enc }
+$enc = [System.Text.Encoding]::UTF8
+$msg = New-Object System.Net.Mail.MailMessage
+$msg.From = $From
+foreach ($to in $ToList) { $msg.To.Add($to) }
 
-  foreach ($p in $Attachments) {
+$msg.Subject         = $Subject
+$msg.SubjectEncoding = $enc
+
+# ★ HTML 본문을 AlternateView로 UTF-8 + Base64 강제
+$msg.IsBodyHtml   = $true
+$msg.Body         = ""             # (본문은 AlternateView로만 보냄)
+$msg.BodyEncoding = $enc
+if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding') { $msg.HeadersEncoding = $enc }
+
+# AlternateView 생성 (text/html, UTF-8)
+$altHtml = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($Body, $enc, "text/html")
+$altHtml.TransferEncoding = [System.Net.Mime.TransferEncoding]::Base64
+# (선택) ContentType.CharSet 보강
+$altHtml.ContentType.CharSet = "utf-8"
+
+$msg.AlternateViews.Clear()
+$msg.AlternateViews.Add($altHtml)
+
+# 첨부 파일 (파일명 인코딩)
+foreach ($p in $Attachments) {
     if ($p -and (Test-Path -LiteralPath $p)) {
-      $att = New-Object System.Net.Mail.Attachment($p)
-      if ($att.PSObject.Properties.Name -contains 'NameEncoding') { $att.NameEncoding = $enc }
-      $msg.Attachments.Add($att) | Out-Null
+        $att = New-Object System.Net.Mail.Attachment($p)
+        if ($att.PSObject.Properties.Name -contains 'NameEncoding') {
+            $att.NameEncoding = $enc
+        }
+        $msg.Attachments.Add($att) | Out-Null
     }
-  }
-
-  $client = New-Object System.Net.Mail.SmtpClient($SmtpHost, $SmtpPort)
-  $client.EnableSsl = $true
-  if ($User -and $Pass) { $client.Credentials = New-Object System.Net.NetworkCredential($User, $Pass) }
-
-  try {
-    $client.Send($msg)
-    if ($LogPath) { "[MAIL][OK] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Subject=$Subject" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
-  } catch {
-    $err = $_.Exception.Message
-    if ($LogPath) { "[MAIL][ERROR] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $err" | Out-File -FilePath $LogPath -Append -Encoding UTF8 }
-    throw
-  } finally {
-    $msg.Dispose(); $client.Dispose()
-  }
 }
+
+$client = New-Object System.Net.Mail.SmtpClient($SmtpHost, $SmtpPort)
+$client.EnableSsl = $true
+if ($User -and $Pass) {
+    $client.Credentials = New-Object System.Net.NetworkCredential($User, $Pass)
+}
+$client.Send($msg)
 
 # ===== 수신자/첨부 구성 후 발송 =====
 $ToList = $MAIL_TO.Split(',;') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
