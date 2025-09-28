@@ -198,18 +198,19 @@ try {
     throw "Missing SMTP settings or recipients. Check .env"
   }
 
-  Add-Type -AssemblyName System.Net.Mail
-  $mail = New-Object System.Net.Mail.MailMessage
-  $mail.From = $MAIL_FROM
-  foreach ($rcpt in $toList) { $mail.To.Add($rcpt) }
-  $mail.Subject = $subject
-  $mail.Body = $body
-  $mail.IsBodyHtml = $false
+$subject = "[Autotrade Daily Report] $DATE $TagHalf"
+$body    = "자동 생성된 리포트 첨부."
 
-  foreach ($path in $attachments) {
-    $att = New-Object System.Net.Mail.Attachment($path)
-    $mail.Attachments.Add($att) | Out-Null
-  }
+Send-MailMessage `
+  -SmtpServer $SMTP_HOST `
+  -Port $SMTP_PORT `
+  -Credential (New-Object PSCredential($SMTP_USER,(ConvertTo-SecureString $SMTP_PASS -AsPlainText -Force))) `
+  -UseSsl `
+  -From $MAIL_FROM `
+  -To $MAIL_TO.Split(',') `
+  -Subject $subject `
+  -Body $body `
+  -Attachments $MergedSummaryOut
 
   $client = New-Object System.Net.Mail.SmtpClient($SMTP_HOST, $SMTP_PORT)
   $client.EnableSsl = $true
