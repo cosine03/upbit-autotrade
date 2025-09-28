@@ -217,9 +217,9 @@ $mail.SubjectEncoding = [System.Text.Encoding]::UTF8
 $mail.HeadersEncoding = [System.Text.Encoding]::UTF8
 
 # === ★ 여기서 UTF-8 강제 ★ ===
-# $enc = [System.Text.Encoding]::UTF8
-# $msg.BodyEncoding    = $enc
-# $msg.SubjectEncoding = $enc
+$enc = [System.Text.Encoding]::UTF8
+$msg.BodyEncoding    = $enc
+$msg.SubjectEncoding = $enc
 
 try { $msg.HeadersEncoding = $enc } catch { }  # 일부 환경에서만 지원
 
