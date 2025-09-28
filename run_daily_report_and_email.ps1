@@ -49,19 +49,34 @@ Write-Log "DailyDir        : $DailyDir"
 # ---------- .env loader ----------
 $DotEnv = Join-Path $Root ".env"
 function Load-DotEnv($path) {
-  if (-not (Test-Path $path)) { 
-    Write-Log ".env not found at $path (continuing; mail may fail)"
-    return
-  }
-  Get-Content $path | ForEach-Object {
+# (기존 .env 로딩 루프를 아래처럼 교체)
+if (Test-Path -LiteralPath ".\.env") {
+  Get-Content ".\.env" | ForEach-Object {
     $line = $_.Trim()
-    if ($line -match "^\s*#") { return }           # comment
-    if ($line -notmatch "=")  { return }           # invalid
-    $k,$v = $line -split "=",2
-    $k = $k.Trim()
-    $v = $v.Trim().Trim("'`"").Trim()              # strip quotes if any
+    if (-not $line) { return }                 # 빈 줄 skip
+    if ($line -match '^\s*#') { return }       # 전체 주석 줄 skip
+
+    # (1) 라인 끝 주석 제거 (# 이후로 잘라냄)
+    if ($line.Contains('#')) {
+      $line = $line.Split('#')[0].Trim()
+      if (-not $line) { return }
+    }
+
+    # (2) key=value 파싱
+    $parts = $line.Split('=',2)
+    if ($parts.Count -ne 2) { return }
+    $k = $parts[0].Trim()
+    $v = $parts[1].Trim()
+
+    # (3) 값에 감싼 따옴표 제거
+    if (($v.StartsWith('"') -and $v.EndsWith('"')) -or
+        ($v.StartsWith("'") -and $v.EndsWith("'"))) {
+      $v = $v.Substring(1, $v.Length-2)
+    }
+
     if ($k) { Set-Item -Path ("Env:{0}" -f $k) -Value $v }
   }
+}
   Write-Log ".env loaded."
 }
 Load-DotEnv $DotEnv
