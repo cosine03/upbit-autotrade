@@ -207,9 +207,12 @@ function Send-ReportMail {
   # === 본문을 AlternateView로 UTF-8 + Base64 전송 (가장 호환성 좋음) ===
   $enc = [System.Text.Encoding]::UTF8
   $plainType = New-Object System.Net.Mime.ContentType "text/plain; charset=utf-8"
-  $alt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($Body, $enc, $plainType.MediaType)
+  $msg.IsBodyHtml = $true
+  $htmlType = New-Object System.Net.Mime.ContentType "text/html; charset=utf-8"
+  $alt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($Body, [System.Text.Encoding]::UTF8, $htmlType.MediaType)
   $alt.ContentType.CharSet = "utf-8"
   $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::Base64
+  ...
   $msg.AlternateViews.Clear()
   [void]$msg.AlternateViews.Add($alt)
 
