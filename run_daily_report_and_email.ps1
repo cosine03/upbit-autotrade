@@ -148,7 +148,7 @@ $BodyHtml = @"
 </html>
 "@
 
-# ---------- Mail sender (System.Net.Mail; UTF-8 + HTML Base64) ----------
+# ---------- Mail sender (System.Net.Mail; HTML UTF-8 + Quoted-Printable) ----------
 function Send-ReportMail {
   param(
     [Parameter(Mandatory)][string]$Subject,
@@ -165,28 +165,31 @@ function Send-ReportMail {
 
   $enc = [System.Text.Encoding]::UTF8
 
-  # 1) 메시지 생성
+  # 1) 메시지
   $msg = New-Object System.Net.Mail.MailMessage
   if (-not $From) { throw "MAIL_FROM is empty" }
   $msg.From = $From
   foreach ($to in $ToList) { [void]$msg.To.Add($to) }
 
-  # 2) 제목/헤더 인코딩
+  # 2) 제목 (UTF-8)
   $msg.Subject = $Subject
   $msg.SubjectEncoding = $enc
   if ($msg.PSObject.Properties.Name -contains 'HeadersEncoding') { $msg.HeadersEncoding = $enc }
 
-  # 3) HTML 본문 (AlternateView + Base64)
+  # 3) HTML 본문 (AlternateView + charset 명시 + Quoted-Printable)
   $alt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($BodyHtml, $enc, "text/html")
-  $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::Base64
+  $alt.ContentType.CharSet = "utf-8"
+  $alt.TransferEncoding = [System.Net.Mime.TransferEncoding]::QuotedPrintable
+
   $msg.AlternateViews.Clear()
   $msg.AlternateViews.Add($alt)
-  # 호환용(일부 클라이언트): Body/BodyEncoding도 세팅
-  $msg.IsBodyHtml = $true
+
+  # 호환용: Body에도 세팅
+  $msg.IsBodyHtml  = $true
   $msg.Body        = $BodyHtml
   $msg.BodyEncoding = $enc
 
-  # 4) 첨부 (파일명 UTF-8)
+  # 4) 첨부파일 (파일명 UTF-8)
   foreach ($p in $Attachments) {
     if ($p -and (Test-Path -LiteralPath $p)) {
       $att = New-Object System.Net.Mail.Attachment($p)
