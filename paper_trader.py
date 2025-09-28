@@ -38,7 +38,7 @@ def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
 def now_utc() -> pd.Timestamp:
-    return pd.Timestamp.utcnow().tz_localize("UTC")
+    return pd.Timestamp.now(tz="UTC")
 
 
 # ---------- Data Models ----------
