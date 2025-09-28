@@ -228,15 +228,28 @@ $body = @"
 "@
 
 # ===== 메일 발송 함수 (UTF-8 강제) =====
-$enc = [System.Text.Encoding]::UTF8
-$msg = New-Object System.Net.Mail.MailMessage
-if ($From) { 
+function Send-ReportMail {
+  param(
+    [Parameter(Mandatory)][string]$Subject,
+    [Parameter(Mandatory)][string]$Body,
+    [Parameter(Mandatory)][string[]]$ToList,
+    [string]$From,
+    [string]$SmtpHost,
+    [int]$SmtpPort = 587,
+    [string]$User = $null,
+    [string]$Pass = $null,
+    [string[]]$Attachments = @(),
+    [string]$LogPath = $null
+  )
+  $enc = [System.Text.Encoding]::UTF8
+  $msg = New-Object System.Net.Mail.MailMessage
+  if ($From) { 
     $msg.From = $From 
-} else { 
+  } else { 
     throw "MAIL_FROM is empty" 
+  }
+  foreach ($to in $ToList) { $msg.To.Add($to) }
 }
-foreach ($to in $ToList) { $msg.To.Add($to) }
-
 $msg.Subject         = $Subject
 $msg.SubjectEncoding = $enc
 
