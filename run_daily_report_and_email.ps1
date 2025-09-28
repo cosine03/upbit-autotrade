@@ -193,41 +193,45 @@ foreach ($p in @($MergedSummary, $BreakoutSummary, $BoxLineSummary)) {
 }
 
 # ---------- Send via System.Net.Mail ----------
-try {
-  if (-not $SMTP_HOST -or -not $SMTP_USER -or -not $SMTP_PASS -or -not $MAIL_FROM -or $toList.Count -eq 0) {
-    throw "Missing SMTP settings or recipients. Check .env"
-  }
-
+# 1) 기본 변수
+$DATE    = Get-Date -Format 'yyyy-MM-dd'
+$TagHalf = "TEST"
 $subject = "[Autotrade Daily Report] $DATE $TagHalf"
-$body    = "자동 생성된 리포트 첨부."
+$body    = "자동 생성된 리포트 첨부 (테스트)."
 
-Send-MailMessage `
-  -SmtpServer $SMTP_HOST `
-  -Port $SMTP_PORT `
-  -Credential (New-Object PSCredential($SMTP_USER,(ConvertTo-SecureString $SMTP_PASS -AsPlainText -Force))) `
-  -UseSsl `
-  -From $MAIL_FROM `
-  -To $MAIL_TO.Split(',') `
-  -Subject $subject `
-  -Body $body `
-  -Attachments $MergedSummaryOut
+# 2) 최근 merged summary 하나 첨부 예시
+$attach  = Get-ChildItem -Path .\logs\daily -Recurse -Filter bt_stats_summary_merged*.csv |
+             Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 
-  $client = New-Object System.Net.Mail.SmtpClient($SMTP_HOST, $SMTP_PORT)
-  $client.EnableSsl = $true
-  $client.Credentials = New-Object System.Net.NetworkCredential($SMTP_USER, $SMTP_PASS)
+# 3) UTF-8 메일 전송 (System.Net.Mail)
+$mail = New-Object System.Net.Mail.MailMessage
+$mail.From = $env:MAIL_FROM
+$env:MAIL_TO.Split(',') | ForEach-Object { $mail.To.Add($_.Trim()) }
+$mail.Subject          = $subject
+$mail.Body             = $body
+$mail.IsBodyHtml       = $false
 
-  Write-Log "[MAIL] sending..."
-  $client.Send($mail)
-  Write-Log "[MAIL] sent OK -> $($toList -join ', ')"
-}
-catch {
-  Write-Log "[MAIL][ERROR] $($_.Exception.Message)"
-  exit 1
-}
-finally {
-  if ($mail) { $mail.Dispose() }
-  if ($client) { $client.Dispose() }
+# ★ 인코딩 강제: 제목/본문/헤더/첨부이름
+$utf8 = [System.Text.Encoding]::UTF8
+$mail.SubjectEncoding  = $utf8
+$mail.BodyEncoding     = $utf8
+if ($mail.PSObject.Properties.Name -contains 'HeadersEncoding') { $mail.HeadersEncoding = $utf8 }
+
+if ($attach) {
+  $att = New-Object System.Net.Mail.Attachment($attach)
+  if ($att.PSObject.Properties.Name -contains 'NameEncoding') { $att.NameEncoding = $utf8 }
+  $mail.Attachments.Add($att)
 }
 
-Write-Log "== DONE =="
+$smtp = New-Object System.Net.Mail.SmtpClient($env:SMTP_HOST, [int]$env:SMTP_PORT)
+$smtp.EnableSsl  = $true
+$smtp.Credentials = New-Object System.Net.NetworkCredential($env:SMTP_USER, $env:SMTP_PASS)
+
+$smtp.Send($mail)
+
+# 정리
+$mail.Dispose()
+$smtp.Dispose()
+"OK - 메일 전송 완료"
+
 exit 0
