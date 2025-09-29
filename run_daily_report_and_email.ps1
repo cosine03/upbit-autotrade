@@ -160,21 +160,22 @@ function Get-TopHtmlTable {
 
 function Build-TableHtmlOrNote {
   param([string]$Path, [string]$Label, [int]$Top = 10)
+
   if (-not (Test-Path -LiteralPath $Path)) {
-    Write-Log "[HTML] $Label: file missing -> $Path"
-    return "<p style='color:#999'>(no data for $Label)</p>"
+    Write-Log "[HTML] $($Label): file missing -> $Path"
+    return "<p style='color:#999'>(no data for $($Label))</p>"
   }
   try {
     $ht = Get-TopHtmlTable -CsvPath $Path -Top $Top
     if ([string]::IsNullOrWhiteSpace($ht)) {
-      Write-Log "[HTML] $Label: empty html -> $Path"
-      return "<p style='color:#999'>(no data for $Label)</p>"
+      Write-Log "[HTML] $($Label): empty html -> $Path"
+      return "<p style='color:#999'>(no data for $($Label))</p>"
     }
-    Write-Log "[HTML] $Label: ok length=$($ht.Length)"
+    Write-Log "[HTML] $($Label): ok length=$($ht.Length)"
     return $ht
   } catch {
-    Write-Log "[HTML][ERROR] $Label: $($_.Exception.Message)"
-    return "<p style='color:#c00'>(error rendering $Label)</p>"
+    Write-Log "[HTML][ERROR] $($Label): $($_.Exception.Message)"
+    return "<p style='color:#c00'>(error rendering $($Label))</p>"
   }
 }
 
