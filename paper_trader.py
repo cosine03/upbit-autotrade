@@ -1,509 +1,372 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os
-import time
-import argparse
-import logging
-import random
+import os, time, argparse, logging, random
+import pandas as pd
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
-import pandas as pd
-
-# =========================================================
-# Utils
-# =========================================================
+# ------------------------- utils -------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 def ts_str(ts: datetime) -> str:
-    # 표준화(UTC, 초단위)
     return ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
 
-# =========================================================
-# CSV Schema (고정)
-# =========================================================
-SCHEMA_OPEN = [
-    "id","strategy","symbol","event","expiry_h","side",
-    "entry_ts","entry_price","expiry_sec","distance_pct","run_id"
-]
-SCHEMA_CLOSED = [
-    "id","strategy","symbol","event","expiry_h","side",
-    "entry_ts","exit_ts","entry_price","exit_price","pnl","status",
-    "distance_pct","run_id","fee"
-]
-
-def reindex_schema(df: pd.DataFrame, schema: List[str]) -> pd.DataFrame:
-    """DataFrame을 schema 순서로 재정렬하고 누락컬럼을 채운다."""
-    if df is None:
-        return pd.DataFrame(columns=schema)
-    for col in schema:
-        if col not in df.columns:
-            df[col] = pd.NA
-    # 초과 컬럼은 뒤로 보존(디버그용)
-    extra = [c for c in df.columns if c not in schema]
-    return df[schema + extra]
-
-# =========================================================
-# Data Models
-# =========================================================
+# ------------------------- data models -------------------------
 @dataclass
 class OpenTrade:
     id: str
     strategy: str
-    symbol: str
-    event: str
     expiry_h: float
     side: str
     entry_ts: str
     entry_price: float
     expiry_sec: int
+    symbol: str = ""
+    event: str = ""
+    signal_ts: str = ""
     distance_pct: Optional[float] = None
-    run_id: Optional[str] = None
 
 @dataclass
 class ClosedTrade:
     id: str
     strategy: str
-    symbol: str
-    event: str
     expiry_h: float
     side: str
     entry_ts: str
     exit_ts: str
     entry_price: float
     exit_price: float
-    pnl: float          # net pnl (fee 반영)
-    status: str         # "expired"
+    pnl: float
+    status: str  # "expired"
+    symbol: str = ""
+    event: str = ""
+    signal_ts: str = ""
     distance_pct: Optional[float] = None
-    run_id: Optional[str] = None
-    fee: Optional[float] = None
 
-# =========================================================
-# Engine
-# =========================================================
+# ------------------------- engine -------------------------
 class PaperEngine:
     def __init__(
         self,
         root: str,
         expiries_h: List[float],
-        interval: int = 10,
         quick_expiry_secs: Optional[int] = None,
-        # signal options
+        interval: int = 10,
+        # signals / filters
         signals_csv: Optional[str] = None,
         long_only: bool = False,
-        signals_recent_sec: int = 3600,
+        bias_side: str = "resistance",
+        signals_recent_sec: int = 180,
         min_distance_pct: Optional[float] = None,
         max_distance_pct: Optional[float] = None,
         allow_events: Optional[List[str]] = None,
-        cooldown_sec: int = 0,
-        max_opens_per_tick: int = 999999,
-        max_open_positions: int = 999999,
-        fee: float = 0.0,
+        cooldown_sec: int = 300,
+        max_opens_per_tick: int = 3,
+        max_open_positions: int = 30,
+        fee: float = 0.001,
+        reset_open: bool = False,
     ):
         self.root = root
         self.expiries_h = expiries_h
-        self.interval = interval
         self.quick_expiry_secs = quick_expiry_secs
+        self.interval = interval
 
-        # signals
         self.signals_csv = signals_csv
         self.long_only = long_only
-        self.signals_recent_sec = signals_recent_sec
+        self.bias_side = bias_side
+        self.signals_recent_sec = int(signals_recent_sec)
         self.min_distance_pct = min_distance_pct
         self.max_distance_pct = max_distance_pct
-        self.allow_events = [e.strip() for e in (allow_events or []) if str(e).strip()]
-        self.cooldown_sec = cooldown_sec
-        self.max_opens_per_tick = max_opens_per_tick
-        self.max_open_positions = max_open_positions
-        self.fee = fee
+        # 기본: box_breakout, line_breakout + 요청대로 price_in_box도 참고용 포함
+        self.allow_events = allow_events or ["box_breakout", "line_breakout", "price_in_box"]
+        self.cooldown_sec = int(cooldown_sec)
+        self.max_opens_per_tick = int(max_opens_per_tick)
+        self.max_open_positions = int(max_open_positions)
+        self.fee = float(fee)
 
-        # paths
+        self.running = True
         self.logdir = os.path.join(root, "logs", "paper")
         ensure_dir(self.logdir)
         self.fp_trades = os.path.join(self.logdir, "trades.csv")
         self.fp_open = os.path.join(self.logdir, "trades_open.csv")
         self.fp_equity = os.path.join(self.logdir, "equity.csv")
 
-        # equity seed
         if not os.path.exists(self.fp_equity):
             pd.DataFrame([{"ts": ts_str(now_utc()), "equity": 1.0}]).to_csv(self.fp_equity, index=False)
 
-        # file headers 보장
-        if not os.path.exists(self.fp_open):
-            pd.DataFrame(columns=SCHEMA_OPEN).to_csv(self.fp_open, index=False)
-        if not os.path.exists(self.fp_trades):
-            pd.DataFrame(columns=SCHEMA_CLOSED).to_csv(self.fp_trades, index=False)
+        # CSV 헤더 보장 (폐쇄/오픈 공통 슈퍼셋으로 고정)
+        trades_cols = [
+            "id","strategy","expiry_h","side",
+            "symbol","event","signal_ts","distance_pct",
+            "entry_ts","exit_ts","entry_price","exit_price","pnl","status"
+        ]
+        open_cols = [
+            "id","strategy","expiry_h","side",
+            "entry_ts","entry_price","expiry_sec",
+            "symbol","event","signal_ts","distance_pct"
+        ]
+        self.trades_cols = trades_cols
+        self.open_cols = open_cols
 
-        # cooldown memory
-        self._last_open_at: Dict[str, datetime] = {}
+        if not os.path.exists(self.fp_trades):
+            pd.DataFrame(columns=trades_cols).to_csv(self.fp_trades, index=False)
+        if not os.path.exists(self.fp_open):
+            pd.DataFrame(columns=open_cols).to_csv(self.fp_open, index=False)
+
+        if reset_open:
+            # 기존 오픈북 아카이브 후 리셋
+            if os.path.exists(self.fp_open) and os.path.getsize(self.fp_open) > 0:
+                stamp = int(time.time())
+                arch = os.path.join(self.logdir, f"trades_open_{stamp}.csv")
+                try:
+                    os.replace(self.fp_open, arch)
+                except Exception:
+                    pass
+            pd.DataFrame(columns=open_cols).to_csv(self.fp_open, index=False)
+            logging.info("open book reset (archived if existed)")
+
+        # 내부 상태
+        self.last_open_ts_by_symbol: Dict[str, float] = {}  # cooldown 관리(epoch secs)
 
         logging.info(
-            "PaperEngine initialized expiries=%s, long_only=%s, signals_csv=%s, recent=%ss, "
-            "dist=(%s,%s), allow_events=%s, cooldown=%ss, max_per_tick=%s, max_open_positions=%s, "
-            "fee=%s, quick=%s",
-            self.expiries_h, self.long_only, self.signals_csv, self.signals_recent_sec,
-            self.min_distance_pct, self.max_distance_pct, self.allow_events, self.cooldown_sec,
-            self.max_opens_per_tick, self.max_open_positions, self.fee, self.quick_expiry_secs
+            "PaperEngine initialized expiries=%s, long_only=%s, bias=%s, "
+            "signals_csv=%s, recent=%ss, dist=(%s,%s), allow_events=%s, "
+            "cooldown=%ss, max_per_tick=%s, max_open_positions=%s, fee=%s, quick=%s",
+            self.expiries_h, self.long_only, self.bias_side,
+            self.signals_csv, self.signals_recent_sec,
+            self.min_distance_pct, self.max_distance_pct, self.allow_events,
+            self.cooldown_sec, self.max_opens_per_tick, self.max_open_positions,
+            self.fee, self.quick_expiry_secs
         )
-
-    # ---------- Admin ----------
-    def reset_open_book(self):
-        """미결 오픈북 초기화(기존 파일은 archive)."""
-        try:
-            if os.path.exists(self.fp_open):
-                arch = os.path.join(self.logdir, f"trades_open_archive_{int(time.time())}.csv")
-                os.replace(self.fp_open, arch)
-        finally:
-            pd.DataFrame(columns=SCHEMA_OPEN).to_csv(self.fp_open, index=False)
-        logging.info("open book reset (archived if existed)")
 
     # ---------- IO helpers ----------
     def _read_open(self) -> pd.DataFrame:
         try:
             df = pd.read_csv(self.fp_open)
+            # 컬럼 보정
+            for c in self.open_cols:
+                if c not in df.columns:
+                    df[c] = pd.NA
+            return df[self.open_cols]
         except Exception:
-            df = pd.DataFrame(columns=SCHEMA_OPEN)
-        return reindex_schema(df, SCHEMA_OPEN)
+            return pd.DataFrame(columns=self.open_cols)
 
     def _write_open(self, df: pd.DataFrame):
-        reindex_schema(df, SCHEMA_OPEN).to_csv(self.fp_open, index=False)
+        # 컬럼 순서 강제
+        df2 = df.copy()
+        for c in self.open_cols:
+            if c not in df2.columns:
+                df2[c] = pd.NA
+        df2[self.open_cols].to_csv(self.fp_open, index=False)
 
     def _append_closed(self, rows: List[ClosedTrade]):
         if not rows:
-            return 0
-        df_new = pd.DataFrame([asdict(r) for r in rows])
-        df_new = reindex_schema(df_new, SCHEMA_CLOSED)
+            return
+        df = pd.DataFrame([asdict(r) for r in rows])
+        # 컬럼 보정
+        for c in self.trades_cols:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[self.trades_cols]
+        header_needed = not os.path.exists(self.fp_trades) or os.path.getsize(self.fp_trades) == 0
+        df.to_csv(self.fp_trades, mode="a", header=header_needed, index=False)
 
-        header_flag = not (os.path.exists(self.fp_trades) and os.path.getsize(self.fp_trades) > 0)
-        # 기존 파일의 헤더 순서를 따르도록 시도(혼선 방지)
-        if not header_flag:
-            try:
-                exist_cols = list(pd.read_csv(self.fp_trades, nrows=0).columns)
-                for col in exist_cols:
-                    if col not in df_new.columns:
-                        df_new[col] = pd.NA
-                df_new = df_new[exist_cols]
-            except Exception:
-                header_flag = True
-
-        df_new.to_csv(self.fp_trades, mode="a", header=header_flag, index=False)
-        return len(rows)
-
-    # =====================================================
-    # Signals → Entries
-    # =====================================================
-    def _load_signal_df(self) -> pd.DataFrame:
+    # ---------- signals ----------
+    def _load_signals(self) -> pd.DataFrame:
         if not self.signals_csv or not os.path.exists(self.signals_csv):
-            return pd.DataFrame()
+            return pd.DataFrame(columns=["ts","event","side","symbol","distance_pct"])
         try:
             df = pd.read_csv(self.signals_csv)
         except Exception:
-            return pd.DataFrame()
+            return pd.DataFrame(columns=["ts","event","side","symbol","distance_pct"])
 
-        # 컬럼 표준화 시도
-        # 기대 컬럼: ts, symbol, event, side, distance_pct
-        rename_map = {}
-        # 타임스탬프 후보
-        for cand in ["ts", "signal_ts", "time", "timestamp"]:
-            if cand in df.columns:
-                rename_map[cand] = "ts"
-                break
-        # 심볼 후보
-        for cand in ["symbol", "ticker", "market", "pair"]:
-            if cand in df.columns:
-                rename_map[cand] = "symbol"
-                break
-        # 이벤트 후보
-        for cand in ["event", "evt", "signal", "type"]:
-            if cand in df.columns:
-                rename_map[cand] = "event"
-                break
-        # 방향 후보
-        for cand in ["side", "direction"]:
-            if cand in df.columns:
-                rename_map[cand] = "side"
-                break
-        # distance 후보
-        for cand in ["distance_pct", "distance", "price_in_box", "dist"]:
-            if cand in df.columns:
-                rename_map[cand] = "distance_pct"
-                break
-
-        if rename_map:
-            df = df.rename(columns=rename_map)
-
-        # 필수 컬럼 보정
-        for need in ["ts", "symbol", "event"]:
-            if need not in df.columns:
-                df[need] = pd.NA
-        if "side" not in df.columns:
-            df["side"] = "long"  # 기본 long
-        if "distance_pct" not in df.columns:
-            df["distance_pct"] = pd.NA
-
-        # 타입 변환/정리
-        # ts를 datetime으로
-        def _parse_ts(x):
-            if pd.isna(x):
+        # ts 파싱
+        def parse_ts(x):
+            try:
+                # csv ts는 ISO-8601(오프셋 포함) 가정
+                return datetime.fromisoformat(str(x))
+            except Exception:
                 return pd.NaT
-            s = str(x)
-            try:
-                # 2025-09-29 05:50:59 or ISO
-                return pd.to_datetime(s, utc=True)
-            except Exception:
-                # epoch(sec or ms)
-                try:
-                    xv = float(s)
-                    if xv > 1e12:  # ms
-                        xv = xv / 1000.0
-                    return pd.to_datetime(xv, unit="s", utc=True)
-                except Exception:
-                    return pd.NaT
 
-        df["ts"] = df["ts"].apply(_parse_ts)
+        df["ts_parsed"] = df["ts"].apply(parse_ts)
+        df = df.dropna(subset=["ts_parsed"])
+        df = df.sort_values("ts_parsed")
+        return df
 
-        # distance float
-        def _to_float(v):
-            try:
-                return float(v)
-            except Exception:
-                return float("nan")
+    def _filter_signals(self, sig_df: pd.DataFrame) -> pd.DataFrame:
+        if sig_df.empty:
+            return sig_df
 
-        df["distance_pct"] = df["distance_pct"].apply(_to_float)
+        df = sig_df.copy()
 
+        # 이벤트 화이트리스트
+        df = df[df["event"].isin(self.allow_events)]
+
+        # long-only 편향
+        if self.long_only:
+            df = df[df["side"] == self.bias_side]
+
+        # 최근성
+        if self.signals_recent_sec > 0:
+            cutoff = now_utc() - timedelta(seconds=self.signals_recent_sec)
+            df = df[df["ts_parsed"] >= cutoff]
+
+        # 거리 필터
+        if (self.min_distance_pct is not None) or (self.max_distance_pct is not None):
+            df["distance_pct_num"] = pd.to_numeric(df.get("distance_pct"), errors="coerce")
+            df = df[df["distance_pct_num"].notna()]
+            if self.min_distance_pct is not None:
+                df = df[df["distance_pct_num"] >= float(self.min_distance_pct)]
+            if self.max_distance_pct is not None:
+                df = df[df["distance_pct_num"] <= float(self.max_distance_pct)]
+
+        # 심볼/타임프레임 중복 제거(가장 최신만)
+        df = df.drop_duplicates(subset=["symbol"], keep="last")
         return df
 
     def _open_from_signals(self) -> int:
-        """CSV 시그널에서 신규 엔트리 생성."""
-        df = self._load_signal_df()
-        if df.empty:
+        sig_df = self._load_signals()
+        cand = self._filter_signals(sig_df)
+        if cand.empty:
             return 0
 
-        # 최근 N초 필터
-        if self.signals_recent_sec and self.signals_recent_sec > 0:
-            cutoff = now_utc() - timedelta(seconds=self.signals_recent_sec)
-            df = df[df["ts"] >= pd.Timestamp(cutoff)]
-        # 이벤트 필터
-        if self.allow_events:
-            df = df[df["event"].astype(str).isin(self.allow_events)]
-        # 방향 필터
-        if self.long_only:
-            df = df[df["side"].astype(str).str.lower() == "long"]
-        # distance 범위
-        if self.min_distance_pct is not None:
-            df = df[df["distance_pct"] >= self.min_distance_pct]
-        if self.max_distance_pct is not None:
-            df = df[df["distance_pct"] <= self.max_distance_pct]
-
-        if df.empty:
-            return 0
-
-        # 오픈북/쿨다운/최대치 체크
         open_df = self._read_open()
-        now_s = ts_str(now_utc())
-        opened = 0
+        open_symbols = set(open_df["symbol"].dropna().astype(str)) if not open_df.empty else set()
 
-        # 현재 오픈 포지션 수 제한
-        open_now = 0 if open_df.empty else len(open_df.index)
-        if open_now >= self.max_open_positions:
+        opened = 0
+        now_s = ts_str(now_utc())
+        now_epoch = time.time()
+
+        # 만기(sec) 계산
+        def expiry_secs_for(eh: float) -> int:
+            return int(self.quick_expiry_secs if self.quick_expiry_secs else eh * 3600)
+
+        # 포지션 수 한도
+        current_open = 0 if open_df.empty else len(open_df)
+        remaining_capacity = max(0, self.max_open_positions - current_open)
+        per_tick_capacity = min(self.max_opens_per_tick, remaining_capacity)
+        if per_tick_capacity <= 0:
             return 0
 
-        # expiry 설정(첫 만기 사용; quick이면 quick)
-        if self.quick_expiry_secs and self.quick_expiry_secs > 0:
-            exp_sec = int(self.quick_expiry_secs)
-            exp_h = self.quick_expiry_secs / 3600.0
-        else:
-            exp_h = float(self.expiries_h[0])
-            exp_sec = int(exp_h * 3600)
-
-        for _, r in df.sort_values("ts").iterrows():
-            if opened >= self.max_opens_per_tick:
+        for _, r in cand.iterrows():
+            if opened >= per_tick_capacity:
                 break
-            if open_now + opened >= self.max_open_positions:
-                break
-
-            symbol = str(r.get("symbol", "")).strip()
-            event = str(r.get("event", "")).strip()
-            side = str(r.get("side", "long")).strip().lower()
-            dist = r.get("distance_pct", float("nan"))
-
-            # cooldown
-            if self.cooldown_sec > 0 and symbol:
-                last = self._last_open_at.get(symbol)
-                if last and (now_utc() - last).total_seconds() < self.cooldown_sec:
-                    continue
-
-            # 같은 심볼/만기 중복 방지: 이미 열려있는지 체크
-            duplicate = False
-            if not open_df.empty:
-                dup_mask = (open_df["symbol"].astype(str) == symbol) & (open_df["expiry_h"].astype(float) == float(exp_h))
-                if dup_mask.any():
-                    duplicate = True
-            if duplicate:
+            sym = str(r.get("symbol", "")).strip()
+            if not sym:
                 continue
 
-            trade_id = f"S{int(time.time()*1000)}_{symbol}_{event}_{str(exp_h).replace('.','_')}"
+            # 이미 보유 중이면 스킵
+            if sym in open_symbols:
+                continue
 
-            row = OpenTrade(
-                id=trade_id,
-                strategy="tv_signal",
-                symbol=symbol,
-                event=event,
-                expiry_h=exp_h,
-                side=side,
-                entry_ts=now_s,
-                entry_price=100.0,        # 더미 가격(실거래 연동 전)
-                expiry_sec=exp_sec,
-                distance_pct=None if pd.isna(dist) else float(dist),
-                run_id=None
-            )
-            new_row = pd.DataFrame([asdict(row)])
-            open_df = pd.concat([open_df, reindex_schema(new_row, SCHEMA_OPEN)], ignore_index=True)
-            opened += 1
-            if symbol:
-                self._last_open_at[symbol] = now_utc()
+            # 쿨다운
+            last_t = self.last_open_ts_by_symbol.get(sym, 0)
+            if now_epoch - last_t < self.cooldown_sec:
+                continue
+
+            # 진입(만기 리스트마다 1개만) — 가장 짧은 만기 우선
+            for eh in sorted(self.expiries_h):
+                trade_id = f"S{int(time.time()*1000)}_{sym}_{r.get('event','')}_{str(eh).replace('.','_')}"
+                expiry_sec = expiry_secs_for(eh)
+                row = OpenTrade(
+                    id=trade_id,
+                    strategy="tv_signal",
+                    expiry_h=eh,
+                    side="long",  # long-only
+                    entry_ts=now_s,
+                    entry_price=100.0,  # 더미 (실계좌 연결 전까지)
+                    expiry_sec=expiry_sec,
+                    symbol=sym,
+                    event=str(r.get("event","")),
+                    signal_ts=str(r.get("ts","")),
+                    distance_pct=float(r["distance_pct_num"]) if "distance_pct_num" in r and pd.notna(r["distance_pct_num"]) else None,
+                )
+                new_row = pd.DataFrame([asdict(row)])
+                frames = [df for df in (open_df, new_row) if not df.empty]
+                open_df = pd.concat(frames, ignore_index=True) if frames else new_row
+                opened += 1
+                open_symbols.add(sym)
+                self.last_open_ts_by_symbol[sym] = now_epoch
+                break  # 같은 심볼로 여러 만기 중복 진입 방지
 
         if opened:
             self._write_open(open_df)
-
-        if opened:
-            logging.info("opened %d trade(s) from signals", opened)
         return opened
 
-    # =====================================================
-    # Dummy test entries (만기 검증용)
-    # =====================================================
-    def _maybe_open_one_per_expiry(self) -> int:
-        """테스트용: 만기별로 미결 없으면 하나씩 오픈."""
-        open_df = self._read_open()
-        now_s = ts_str(now_utc())
-        created = 0
-        for eh in self.expiries_h:
-            # 이미 같은 만기의 미결이 있으면 skip
-            exists = False
-            if not open_df.empty:
-                try:
-                    exists = (open_df["expiry_h"].astype(float) == float(eh)).any()
-                except Exception:
-                    exists = False
-            if exists:
-                continue
-
-            trade_id = f"T{int(time.time()*1000)}_{str(eh).replace('.','_')}"
-            side = "long" if self.long_only else random.choice(["long", "short"])
-            entry_price = 100.0
-            expiry_sec = int(self.quick_expiry_secs if self.quick_expiry_secs else eh * 3600)
-
-            row = OpenTrade(
-                id=trade_id,
-                strategy="test_strategy",
-                symbol="",
-                event="",
-                expiry_h=float(eh),
-                side=side,
-                entry_ts=now_s,
-                entry_price=entry_price,
-                expiry_sec=expiry_sec,
-                distance_pct=None,
-                run_id=None
-            )
-            new_row = pd.DataFrame([asdict(row)])
-            open_df = pd.concat([open_df, reindex_schema(new_row, SCHEMA_OPEN)], ignore_index=True)
-            created += 1
-
-        if created:
-            self._write_open(open_df)
-            logging.info("opened %d test trade(s)", created)
-        return created
-
-    # =====================================================
-    # Close expired
-    # =====================================================
+    # ---------- exits ----------
     def _close_expired(self) -> int:
         open_df = self._read_open()
         if open_df.empty:
             return 0
 
         now_dt = now_utc()
-        remain_rows = []
-        closed: List[ClosedTrade] = []
+        remaining = []
+        closed_rows: List[ClosedTrade] = []
 
         for _, r in open_df.iterrows():
             try:
-                entry_dt = pd.to_datetime(str(r["entry_ts"]), utc=True).to_pydatetime()
+                entry_dt = datetime.strptime(str(r["entry_ts"]), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             except Exception:
-                # 잘못 기록된 행은 남기지 않고 skip
+                # entry_ts가 비정상인 행은 보존하지 않음
                 continue
 
-            eh = float(r.get("expiry_h", 0.0))
-            exp_sec = int(r.get("expiry_sec", int(eh * 3600)))
-            if now_dt >= entry_dt + timedelta(seconds=exp_sec):
-                # 더미 가격 변화 (±0.1~0.3%)
+            expiry_td = timedelta(seconds=int(r["expiry_sec"]))
+            if now_dt >= entry_dt + expiry_td:
+                # 더미 PnL: ±0.1~0.3%에 수수료 왕복 차감
                 drift = random.uniform(0.001, 0.003)
                 sign = 1 if random.random() < 0.55 else -1
                 gross = sign * drift
-                # 왕복 수수료 2 * fee
-                net = gross - (2 * self.fee)
+                net = gross - 2.0 * self.fee  # 진입/청산 왕복 수수료 가정
+                exit_price = float(r["entry_price"]) * (1.0 + net)
 
-                entry_price = float(r.get("entry_price", 100.0))
-                exit_price = entry_price * (1.0 + net)
-
-                closed.append(ClosedTrade(
-                    id=str(r.get("id", "")),
-                    strategy=str(r.get("strategy", "")),
-                    symbol=str(r.get("symbol", "")),
-                    event=str(r.get("event", "")),
-                    expiry_h=float(r.get("expiry_h", 0.0)),
-                    side=str(r.get("side", "")),
-                    entry_ts=str(r.get("entry_ts", "")),
+                closed = ClosedTrade(
+                    id=r["id"],
+                    strategy=str(r["strategy"]),
+                    expiry_h=float(r["expiry_h"]),
+                    side=str(r["side"]),
+                    entry_ts=str(r["entry_ts"]),
                     exit_ts=ts_str(now_dt),
-                    entry_price=entry_price,
+                    entry_price=float(r["entry_price"]),
                     exit_price=exit_price,
                     pnl=net,
                     status="expired",
-                    distance_pct=(None if pd.isna(r.get("distance_pct", pd.NA)) else float(r.get("distance_pct"))),
-                    run_id=str(r.get("run_id", "")) if r.get("run_id", None) is not None else None,
-                    fee=self.fee
-                ))
+                    symbol=str(r.get("symbol","")),
+                    event=str(r.get("event","")),
+                    signal_ts=str(r.get("signal_ts","")),
+                    distance_pct=float(r.get("distance_pct")) if pd.notna(r.get("distance_pct")) else None,
+                )
+                closed_rows.append(closed)
             else:
-                remain_rows.append(r)
+                remaining.append(r)
 
-        if closed:
-            n = self._append_closed(closed)
-            logging.info("closed %d trade(s)", n)
+        if closed_rows:
+            self._append_closed(closed_rows)
 
-        # 남은 open 갱신
-        if remain_rows:
-            self._write_open(pd.DataFrame(remain_rows))
+        # 오픈북 갱신
+        if remaining:
+            self._write_open(pd.DataFrame(remaining))
         else:
-            self._write_open(pd.DataFrame(columns=SCHEMA_OPEN))
+            self._write_open(pd.DataFrame(columns=self.open_cols))
 
-        return len(closed)
+        return len(closed_rows)
 
-    # =====================================================
-    # Ticks
-    # =====================================================
-    def run_once(self) -> None:
-        # 1) 만기 도달 청산
-        n_closed = self._close_expired()
-        # 2) 시그널 기반 오픈(있으면), 없으면 테스트 엔트리
-        if self.signals_csv:
-            n_opened = self._open_from_signals()
-        else:
-            n_opened = self._maybe_open_one_per_expiry()
-        logging.info("tick summary: opened=%s closed=%s", n_opened, n_closed)
+    # ---------- main ticks ----------
+    def run_once(self) -> Tuple[int, int]:
+        opened = self._open_from_signals()
+        closed = self._close_expired()
+        return opened, closed
 
     def loop(self, interval_sec: int, stop_at: Optional[datetime] = None):
         logging.info("engine loop started")
         try:
-            while True:
-                self.run_once()
+            while self.running:
+                opened, closed = self.run_once()
+                logging.info("tick summary: opened=%s closed=%s", opened, closed)
                 if stop_at and now_utc() >= stop_at:
                     logging.info("timebox reached; exiting")
                     break
@@ -514,37 +377,31 @@ class PaperEngine:
             self.close()
 
     def close(self):
+        self.running = False
         logging.info("engine closed")
 
-
-# =========================================================
-# CLI
-# =========================================================
+# ------------------------- CLI -------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    # run modes
     p.add_argument("--once", action="store_true", help="Run one tick and exit")
     p.add_argument("--run-for", type=int, default=None, help="Run for N minutes")
     p.add_argument("--interval", type=int, default=10, help="Loop interval seconds")
-
-    # expiries
     p.add_argument("--expiries", type=str, default="0.5,1,2", help="Expiry hours list, e.g. '0.5,1,2'")
     p.add_argument("--quick-expiry-secs", type=int, default=None, help="Quick test expiry seconds (e.g. 36)")
-
-    # signals
-    p.add_argument("--signals-csv", type=str, default=None, help="Signals CSV path")
-    p.add_argument("--long-only", action="store_true", help="Use only long side")
-    p.add_argument("--signals-recent-sec", type=int, default=3600, help="Only signals within N seconds")
-    p.add_argument("--min-distance-pct", type=float, default=None, help="Min distance filter")
-    p.add_argument("--max-distance-pct", type=float, default=None, help="Max distance filter")
-    p.add_argument("--allow-events", type=str, default=None, help="Comma separated event whitelist")
-    p.add_argument("--cooldown-sec", type=int, default=0, help="Per-symbol cooldown seconds")
-    p.add_argument("--max-opens-per-tick", type=int, default=999999, help="Cap #opens per tick")
-    p.add_argument("--max-open-positions", type=int, default=999999, help="Cap total open positions")
-    p.add_argument("--fee", type=float, default=0.0, help="Per-side fee (net = gross - 2*fee)")
-
-    # housekeeping
-    p.add_argument("--reset-open", action="store_true", help="Clear leftover open-book at start")
+    # signals & filters
+    p.add_argument("--signals-csv", type=str, default=None)
+    p.add_argument("--long-only", action="store_true", help="Only open long positions")
+    p.add_argument("--bias-side", choices=["resistance", "support"], default="resistance",
+                   help="Which side is considered bullish when --long-only (default: resistance)")
+    p.add_argument("--signals-recent-sec", type=int, default=180)
+    p.add_argument("--min-distance-pct", type=float, default=None)
+    p.add_argument("--max-distance-pct", type=float, default=None)
+    p.add_argument("--allow-events", type=str, default="box_breakout,line_breakout,price_in_box")
+    p.add_argument("--cooldown-sec", type=int, default=300)
+    p.add_argument("--max-opens-per-tick", type=int, default=3)
+    p.add_argument("--max-open-positions", type=int, default=30)
+    p.add_argument("--fee", type=float, default=0.001)
+    p.add_argument("--reset-open", action="store_true", help="Archive & reset open book at start")
     return p.parse_args()
 
 def main():
@@ -554,30 +411,31 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logging.info("=== Paper Engine START ===")
-
     args = parse_args()
     root = os.getcwd()
 
-    # expiries 계산
     if args.quick_expiry_secs and args.quick_expiry_secs > 0:
         expiries_h = [args.quick_expiry_secs / 3600.0]
-        logging.info("expiries_h=%s (quick=%ss)", expiries_h, args.quick_expiry_secs)
+        note = f"(quick={args.quick_expiry_secs}s)"
     else:
         expiries_h = [float(x) for x in str(args.expiries).split(",") if x.strip()]
-        logging.info("expiries_h=%s", expiries_h)
+        note = ""
 
-    # allow events list
-    allow_events = None
-    if args.allow_events:
-        allow_events = [x.strip() for x in str(args.allow_events).split(",") if x.strip()]
+    # 이벤트 리스트 파싱
+    allow_events = [e.strip() for e in str(args.allow_events).split(",") if e.strip()]
+
+    logging.info(f"expiries_h={expiries_h} {note}")
+    if args.long_only:
+        logging.info("long_only=True")
 
     eng = PaperEngine(
         root=root,
         expiries_h=expiries_h,
-        interval=args.interval,
         quick_expiry_secs=args.quick_expiry_secs,
+        interval=args.interval,
         signals_csv=args.signals_csv,
         long_only=args.long_only,
+        bias_side=args.bias_side,
         signals_recent_sec=args.signals_recent_sec,
         min_distance_pct=args.min_distance_pct,
         max_distance_pct=args.max_distance_pct,
@@ -586,20 +444,16 @@ def main():
         max_opens_per_tick=args.max_opens_per_tick,
         max_open_positions=args.max_open_positions,
         fee=args.fee,
+        reset_open=args.reset_open,
     )
 
-    logging.info("long_only=%s", args.long_only)
-
-    if args.reset_open:
-        eng.reset_open_book()
-
     if args.once:
-        eng.run_once()
+        opened, closed = eng.run_once()
+        logging.info("single step done; opened=%s closed=%s; exiting", opened, closed)
         eng.close()
-        logging.info("single step done; exiting")
     elif args.run_for:
         stop_at = now_utc() + timedelta(minutes=args.run_for)
-        logging.info("run-for: %s min (stop_at=%s)", args.run_for, stop_at.isoformat())
+        logging.info(f"run-for: {args.run_for} min (stop_at={stop_at.isoformat()})")
         eng.loop(interval_sec=args.interval, stop_at=stop_at)
     else:
         eng.loop(interval_sec=args.interval)
