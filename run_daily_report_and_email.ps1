@@ -238,6 +238,12 @@ foreach ($p in @($MergedSummary, $BreakoutSummary, $BoxLineSummary)) {
   if (Test-Path $p) { $Attachments += (Resolve-Path $p).Path } else { Write-Log "[ATTACH][WARN] not found -> $p" }
 }
 
+# 디버그용 HTML 저장 경로 정의
+$debugHtmlPath = Join-Path $ReportsDir ("email_{0}_{1}.html" -f $DATE, $TagHalf)
+
+# (선택) 본문 HTML이 $BodyHtml 변수라면 파일로 저장
+$BodyHtml | Out-File -FilePath $debugHtmlPath -Encoding UTF8
+
 # ---------- Send (System.Net.Mail with AlternateViews) ----------
 $enc = [System.Text.Encoding]::UTF8
 $msg = New-Object System.Net.Mail.MailMessage
