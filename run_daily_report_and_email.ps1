@@ -30,7 +30,10 @@ $EmailLog = Join-Path $ReportsDir ("email_{0}_{1}_{2}.log" -f $DATE, $TagHalf, $
 function Write-Log([string]$msg) {
   $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
   $line  = "[{0}] {1}" -f $stamp, $msg
-  $line | Tee-Object -FilePath $EmailLog -Append | Out-Null
+  # 콘솔
+  Write-Host $line
+  # 파일 (UTF-8 고정, Append)
+  Add-Content -Path $EmailLog -Value $line -Encoding UTF8
 }
 Write-Log "== RUN START == Root=$Root Half=$TagHalf =="
 
