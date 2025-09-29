@@ -62,34 +62,31 @@ Write-Log ("[CHECK] exists merged={0} breakout={1} boxline={2}" -f `
    $(if (Test-Path $BoxLineSummary) {1}else{0})))
 
 # ---------- 파이프라인(옵션) ----------
+# ---------- Optional: run pipeline before email ----------
 if ($RunPipeline) {
   try {
     Write-Log "[PIPE] start"
     if (-not (Test-Path $DailyDir)) { New-Item -ItemType Directory -Force -Path $DailyDir | Out-Null }
-    if ((Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
-      $b=Import-Csv $BreakoutSummary
-      $l=Import-Csv $BoxLineSummary
-      $b | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "breakout_only" -Force }
-      $l | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "boxin_linebreak" -Force }
-      ($b+$l) | Export-Csv -NoTypeInformation -Encoding UTF8 $MergedSummary
-      Write-Log "merged summary saved -> $MergedSummary"
-    } else {
-      Write-Log "[PIPE][WARN] summary files missing; skip merge."
-    }
+
+    # 새 병합(중복제거 포함)
+    Merge-BacktestSummaries -BreakoutSummary $BreakoutSummary `
+                            -BoxLineSummary  $BoxLineSummary `
+                            -OutPath         $MergedSummary
+
     Write-Log "[PIPE] done"
   } catch {
     Write-Log "[PIPE][ERROR] $($_.Exception.Message)"
   }
 } else {
+  # 파이프라인을 돌리지 않는 경우에도, 병합본이 없고 두 파일이 있으면 병합 한번 수행
   if ((-not (Test-Path $MergedSummary)) -and (Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
     try {
-      $b=Import-Csv $BreakoutSummary
-      $l=Import-Csv $BoxLineSummary
-      $b | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "breakout_only" -Force }
-      $l | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "boxin_linebreak" -Force }
-      ($b+$l) | Export-Csv -NoTypeInformation -Encoding UTF8 $MergedSummary
-      Write-Log "merged summary saved -> $MergedSummary"
-    } catch { Write-Log "[MERGE][ERROR] $($_.Exception.Message)" }
+      Merge-BacktestSummaries -BreakoutSummary $BreakoutSummary `
+                              -BoxLineSummary  $BoxLineSummary `
+                              -OutPath         $MergedSummary
+    } catch {
+      Write-Log "[MERGE][ERROR] $($_.Exception.Message)"
+    }
   }
 }
 
