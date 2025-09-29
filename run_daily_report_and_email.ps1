@@ -24,7 +24,9 @@ $ReportsDir = Join-Path $Root "logs\reports"
 if (-not (Test-Path $ReportsDir)) { New-Item -ItemType Directory -Force -Path $ReportsDir | Out-Null }
 
 # ---------- 로깅 ----------
-$EmailLog = Join-Path $ReportsDir ("email_{0}_{1}.log" -f $DATE, $TagHalf)
+# 변경 (시:분:초까지 포함해 매 실행마다 새 로그)
+$RunStamp = Get-Date -Format "HHmmss"
+$EmailLog = Join-Path $ReportsDir ("email_{0}_{1}_{2}.log" -f $DATE, $TagHalf, $RunStamp)
 function Write-Log([string]$msg) {
   $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
   $line  = "[{0}] {1}" -f $stamp, $msg
