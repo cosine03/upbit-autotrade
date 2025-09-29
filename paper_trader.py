@@ -215,7 +215,21 @@ def main():
                     help="Run for N minutes then exit (0=forever)")
     ap.add_argument("--interval", type=float, default=15.0,
                     help="Loop interval seconds (default=15s)")
+    ap.add_argument("--expiries", type=str, default="0.5,1,2",
+                    help="Expiry hours list, e.g. '0.5,1,2'")
+    ap.add_argument("--quick-expiry-secs", type=int, default=None,
+                    help="Override all expiries with a short test expiry (seconds), e.g. 36")
     args = ap.parse_args()
+
+    # --- expiries 결정 ---
+    if args.quick_expiry_secs is not None and args.quick_expiry_secs > 0:
+        expiries_h = [args.quick_expiry_secs / 3600.0]   # 36초 → 0.01h
+        quick_note = f"(quick-expiry={args.quick_expiry_secs}s)"
+    else:
+        expiries_h = [float(x) for x in str(args.expiries).split(",") if x.strip()]
+        quick_note = ""
+
+    logger.info(f"expiries_h = {expiries_h} {quick_note}")
 
     root = Path(args.root).resolve()
     logs_dir = root / "logs" / "paper"
@@ -234,7 +248,8 @@ def main():
     fp_state     = data_dir / "engine_state.json"
 
     eng = PaperEngine(
-        root=root,
+        root=root_dir,
+        expiries_h=expiries_h,
         data_dir=data_dir,
         logs_dir=logs_dir,
         equity_fp=fp_equity,
