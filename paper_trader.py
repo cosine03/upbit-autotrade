@@ -378,68 +378,23 @@ class PaperEngine:
 
 # ========= CLI =========
 def main():
-    ap = argparse.ArgumentParser(description="Paper Trading Engine")
-    ap.add_argument("--root", type=str, default=".",
-                    help="Project root (default=.)")
-    ap.add_argument("--once", action="store_true",
-                    help="Run single iteration and exit")
-    ap.add_argument("--run-for", type=int, default=0,
-                    help="Run for N minutes then exit (0=forever)")
-    ap.add_argument("--interval", type=float, default=15.0,
-                    help="Loop interval seconds (default=15s)")
-    args = ap.parse_args()
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--once", action="store_true", help="한 번만 step 실행")
+    p.add_argument("--run-for", type=int, help="분 단위로 실행 유지")
+    p.add_argument("--interval", type=int, default=10, help="폴링 주기(초)")
+    p.add_argument("--shadow", action="store_true", help="equity 갱신 없이 로직만")
+    p.add_argument("--price-mode", type=str, default="const", choices=["const","signals","feed"], help="가격 소스")
+    p.add_argument("--expiries", type=str, help='예: "0.5,1,2"')
+    args = p.parse_args()
 
-    root = Path(args.root).resolve()
-    logs_dir = root / "logs" / "paper"
-    data_dir = root / "data" / "paper"
-    ensure_dir(logs_dir)
-    ensure_dir(data_dir)
-
-    logger = setup_logger(logs_dir)
-    logger.info("=== Paper Engine START === root=%s", str(root))
-
-    # file paths
-    fp_equity    = data_dir / "paper_equity.csv"
-    fp_orders    = data_dir / "paper_orders.csv"
-    fp_fills     = data_dir / "paper_fills.csv"
-    fp_positions = data_dir / "paper_positions.csv"
-    fp_state     = data_dir / "engine_state.json"
-
-    eng = PaperEngine(
-        root=root,
-        data_dir=data_dir,
-        logs_dir=logs_dir,
-        equity_fp=fp_equity,
-        orders_fp=fp_orders,
-        fills_fp=fp_fills,
-        positions_fp=fp_positions,
-        state_fp=fp_state,
-        logger=logger,
-    )
-
-    try:
-        if args.once:
-            eng.step()
-            logger.info("single step done; exiting")
-            return
-
-        stop_at: Optional[pd.Timestamp] = None
-        if args.run_for > 0:
-            stop_at = now_utc() + pd.Timedelta(minutes=args.run_for)
-            logger.info("run-for: %d min (stop_at=%s)", args.run_for, stop_at.isoformat())
-
-        while True:
-            eng.step()
-            if stop_at and now_utc() >= stop_at:
-                logger.info("timebox reached; exiting")
-                break
-            time.sleep(max(0.0, args.interval))
-
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt - shutting down...")
-    finally:
-        eng.close()
-        logger.info("=== Paper Engine END ===")
+    expiries = parse_expiries_arg(args.expiries)
+    eng = PaperEngine(interval_sec=args.interval, shadow=args.shadow,
+                      price_mode=args.price_mode, expiries=expiries)
+    if args.once:
+        eng.step()
+    else:
+        eng.run(run_for_min=args.run_for)
 
 if __name__ == "__main__":
     main()
