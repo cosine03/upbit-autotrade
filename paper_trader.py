@@ -1,76 +1,104 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+Paper Trading Engine (patched)
+- 백테스트 가정과 최대한 동일한 제약/필터 이식
+- 신호 CSV 연동 + 최근신호 윈도우 + 백로그 가드(last_processed_ts)
+- 심볼 쿨다운, 틱당 오픈 상한, 동시보유 상한
+- long-only 옵션
+- 수수료 반영(pnl_net = pnl_gross - 2*fee)
+- 로그/CSV 경로: ./logs/paper/
+    - trades_open.csv  : 오픈 포지션
+    - trades.csv       : 체결/청산 기록
+    - equity.csv       : (자리만 확보) 향후 에쿼티 추적용
+    - state.json       : last_processed_ts, cooldown 기록
+신호 CSV 예상 컬럼(유연 파싱): ts, symbol, event, distance_pct, price
+- ts: "YYYY-MM-DD HH:MM:SS" (UTC 가정) 또는 epoch(sec/ms)
+- price가 없으면 entry_price=100.0 더미
+"""
 
 import os
-import io
+import json
 import time
 import argparse
 import logging
-import pandas as pd
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict
+
+import pandas as pd
 import random
-from typing import Optional, List, Tuple
 
 # ------------------------- utils -------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def ts_str(ts: datetime) -> str:
+def ts_to_str_utc(ts: datetime) -> str:
     return ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+def parse_ts_any(x) -> Optional[datetime]:
+    """다양한 포맷의 ts를 UTC-aware 로 파싱."""
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        # epoch sec 혹은 ms 추정
+        if x > 1e12:  # ms
+            return datetime.fromtimestamp(x / 1000.0, tz=timezone.utc)
+        return datetime.fromtimestamp(x, tz=timezone.utc)
+    s = str(x).strip()
+    if not s:
+        return None
+    # 1) ISO/스페이스 포맷 시도
+    for fmt in ("%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y/%m/%d %H:%M:%S",
+                "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    # 2) pandas 파서로 최후 시도
+    try:
+        dt = pd.to_datetime(s, utc=True)
+        if dt.tzinfo is None:
+            dt = dt.tz_localize("UTC")
+        return dt.to_pydatetime()
+    except Exception:
+        return None
 
 def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
-
-def parse_ts_any(s: str) -> datetime:
-    """
-    문자열 타임스탬프를 UTC-aware datetime으로 파싱.
-    지원: 'YYYY-mm-dd HH:MM:SS' (naive→UTC 가정), ISO8601(+offset 포함)
-    """
-    s = str(s).strip()
-    # ISO8601 시도
-    try:
-        dt = pd.to_datetime(s, utc=True)
-        if pd.isna(dt):
-            raise ValueError
-        return dt.to_pydatetime()
-    except Exception:
-        pass
-    # naive 포맷(기존 요약 통계와 일관)
-    try:
-        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        return dt.replace(tzinfo=timezone.utc)
-    except Exception:
-        raise ValueError(f"Unrecognized timestamp format: {s}")
 
 # ------------------------- data models -------------------------
 @dataclass
 class OpenTrade:
     id: str
     strategy: str
-    symbol: str
-    event: str
     expiry_h: float
     side: str
-    entry_ts: str
+    symbol: str
+    event: str
+    entry_ts: str   # UTC str
     entry_price: float
     expiry_sec: int
-    signal_ts: str  # 원본 시그널 시각(트레이싱용)
+    distance_pct: float
 
 @dataclass
 class ClosedTrade:
     id: str
     strategy: str
-    symbol: str
-    event: str
     expiry_h: float
     side: str
+    symbol: str
+    event: str
     entry_ts: str
     exit_ts: str
     entry_price: float
     exit_price: float
-    pnl: float
-    status: str  # "expired"
+    pnl_gross: float      # 비율(+0.008 = +0.8%)
+    fee_round: float      # 왕복 수수료 비율(2*fee)
+    pnl_net: float        # pnl_gross - fee_round
+    status: str           # "expired"
 
 # ------------------------- engine -------------------------
 class PaperEngine:
@@ -78,76 +106,105 @@ class PaperEngine:
         self,
         root: str,
         expiries_h: List[float],
+        signals_csv: Optional[str] = None,
+        long_only: bool = True,
+        signals_recent_sec: int = 60,
+        min_distance_pct: Optional[float] = None,
+        max_distance_pct: Optional[float] = None,
+        allow_events: Optional[List[str]] = None,
+        cooldown_sec: int = 300,
+        max_opens_per_tick: int = 3,
+        max_open_positions: int = 30,
+        fee: float = 0.001,
         quick_expiry_secs: Optional[int] = None,
         interval: int = 10,
-        long_only: bool = True,
-        signals_csv: Optional[str] = None,
-        default_strategy: str = "tv_signal",
-        cooldown_sec: int = 60,
     ):
         self.root = root
         self.expiries_h = expiries_h
+        self.signals_csv = signals_csv
+        self.long_only = long_only
+        self.signals_recent_sec = signals_recent_sec
+        self.min_distance_pct = min_distance_pct
+        self.max_distance_pct = max_distance_pct
+        self.allow_events = set([e.strip() for e in allow_events]) if allow_events else None
+        self.cooldown_sec = cooldown_sec
+        self.max_opens_per_tick = max_opens_per_tick
+        self.max_open_positions = max_open_positions
+        self.fee = fee
         self.quick_expiry_secs = quick_expiry_secs
         self.interval = interval
-        self.long_only = long_only
-        self.signals_csv = signals_csv or os.path.join(root, "logs", "signals_tv.csv")
-        self.default_strategy = default_strategy
-        self.cooldown_sec = max(0, int(cooldown_sec))
-        self.running = True
 
+        # paths
         self.logdir = os.path.join(root, "logs", "paper")
         ensure_dir(self.logdir)
-
         self.fp_trades = os.path.join(self.logdir, "trades.csv")
         self.fp_open = os.path.join(self.logdir, "trades_open.csv")
         self.fp_equity = os.path.join(self.logdir, "equity.csv")
+        self.fp_state = os.path.join(self.logdir, "state.json")
 
-        # equity.csv 헤더 보장
+        # files bootstrap
         if not os.path.exists(self.fp_equity):
-            pd.DataFrame([{"ts": ts_str(now_utc()), "equity": 1.0}]).to_csv(self.fp_equity, index=False)
+            pd.DataFrame([{"ts": ts_to_str_utc(now_utc()), "equity": 1.0}]).to_csv(self.fp_equity, index=False)
 
-        # trades.csv 헤더 보장
         if not os.path.exists(self.fp_trades):
             pd.DataFrame(columns=[
-                "id","strategy","symbol","event","expiry_h","side",
-                "entry_ts","exit_ts","entry_price","exit_price","pnl","status"
+                "id","strategy","expiry_h","side","symbol","event",
+                "entry_ts","exit_ts","entry_price","exit_price",
+                "pnl_gross","fee_round","pnl_net","status"
             ]).to_csv(self.fp_trades, index=False)
 
-        # trades_open.csv 헤더 보장
         if not os.path.exists(self.fp_open):
             pd.DataFrame(columns=[
-                "id","strategy","symbol","event","expiry_h","side",
-                "entry_ts","entry_price","expiry_sec","signal_ts"
+                "id","strategy","expiry_h","side","symbol","event",
+                "entry_ts","entry_price","expiry_sec","distance_pct"
             ]).to_csv(self.fp_open, index=False)
 
-        # long-only라면 기존 short 오픈 포지션 제거
-        if self.long_only and os.path.exists(self.fp_open):
-            try:
-                df = pd.read_csv(self.fp_open)
-                if not df.empty and "side" in df.columns:
-                    new_df = df[df["side"].astype(str).str.lower() == "long"].copy()
-                    if len(new_df) != len(df):
-                        logging.info(f"purged {len(df) - len(new_df)} short open trades (long-only mode)")
-                        new_df.to_csv(self.fp_open, index=False)
-            except Exception as e:
-                logging.warning(f"cleanup open(short) failed: {e}")
-
-        # signals incremental read offset 파일
-        self.fp_sig_offset = self.signals_csv + ".offset"
+        # state (last_processed_ts, cooldown table)
+        self.state = self._load_state()
+        self.last_open_time: Dict[str, datetime] = {
+            # symbol -> datetime(UTC)
+        }
+        # 기존 오픈 CSV의 최신 엔트리시각을 쿨다운 힌트로 사용할 수도 있지만 간단화
 
         logging.info(
-            f"PaperEngine initialized expiries={self.expiries_h}, quick={self.quick_expiry_secs}, "
-            f"long_only={self.long_only}, signals_csv={self.signals_csv}, cooldown={self.cooldown_sec}s"
+            "PaperEngine initialized "
+            f"expiries={self.expiries_h}, long_only={self.long_only}, signals_csv={self.signals_csv}, "
+            f"recent={self.signals_recent_sec}s, dist=({self.min_distance_pct},{self.max_distance_pct}), "
+            f"allow_events={sorted(list(self.allow_events)) if self.allow_events else None}, "
+            f"cooldown={self.cooldown_sec}s, max_per_tick={self.max_opens_per_tick}, "
+            f"max_open_positions={self.max_open_positions}, fee={self.fee}, quick={self.quick_expiry_secs}"
         )
 
-    # ---------- IO helpers ----------
+    # ---------- state io ----------
+    def _load_state(self) -> dict:
+        if os.path.exists(self.fp_state):
+            try:
+                with open(self.fp_state, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                    # normalize
+                    if "last_processed_ts" in obj and obj["last_processed_ts"]:
+                        dt = parse_ts_any(obj["last_processed_ts"])
+                        obj["last_processed_ts"] = ts_to_str_utc(dt) if dt else None
+                    return obj
+            except Exception:
+                pass
+        return {"last_processed_ts": None, "cooldown": {}}
+
+    def _save_state(self):
+        try:
+            with open(self.fp_state, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.warning(f"state save failed: {e}")
+
+    # ---------- open/close csv helpers ----------
     def _read_open(self) -> pd.DataFrame:
         try:
             return pd.read_csv(self.fp_open)
         except Exception:
             return pd.DataFrame(columns=[
-                "id","strategy","symbol","event","expiry_h","side",
-                "entry_ts","entry_price","expiry_sec","signal_ts"
+                "id","strategy","expiry_h","side","symbol","event",
+                "entry_ts","entry_price","expiry_sec","distance_pct"
             ])
 
     def _write_open(self, df: pd.DataFrame):
@@ -159,265 +216,248 @@ class PaperEngine:
         df = pd.DataFrame([asdict(r) for r in rows])
         df.to_csv(self.fp_trades, mode="a", header=not os.path.getsize(self.fp_trades), index=False)
 
-    # ---------- signals incremental reader ----------
-    def _read_new_signal_lines(self) -> Optional[str]:
-        """signals_csv에서 지난 오프셋 이후의 raw 텍스트를 반환."""
-        if not os.path.exists(self.signals_csv):
-            return None
-        last_off = 0
-        if os.path.exists(self.fp_sig_offset):
-            try:
-                with open(self.fp_sig_offset, "r", encoding="utf-8") as f:
-                    last_off = int(f.read().strip() or "0")
-            except Exception:
-                last_off = 0
-        size_now = os.path.getsize(self.signals_csv)
-        if size_now <= last_off:
-            return None  # 신규 없음
-        with open(self.signals_csv, "rb") as f:
-            f.seek(last_off)
-            chunk = f.read()
-        # 오프셋 갱신
-        with open(self.fp_sig_offset, "w", encoding="utf-8") as f:
-            f.write(str(size_now))
-        # CSV 텍스트(추가분)
+    # ---------- signals loader & filters ----------
+    def _load_signals_df(self) -> pd.DataFrame:
+        """신호 CSV를 관대한 스키마로 로드하고 핵심 컬럼을 빚어낸다."""
+        if not self.signals_csv or not os.path.exists(self.signals_csv):
+            return pd.DataFrame(columns=["ts","symbol","event","distance_pct","price"])
         try:
-            return chunk.decode("utf-8")
+            df = pd.read_csv(self.signals_csv)
         except UnicodeDecodeError:
-            return chunk.decode("cp949", errors="replace")
-
-    def _parse_signals_csv_text(self, csv_text: str) -> pd.DataFrame:
-        """
-        추가된 CSV 텍스트를 DF로 파싱. 최소 컬럼(ts,symbol,event)이 필요.
-        선택 컬럼: strategy, side, expiry_h
-        """
-        if not csv_text:
-            return pd.DataFrame()
-        df = pd.read_csv(io.StringIO(csv_text))
-        # 표준화
+            df = pd.read_csv(self.signals_csv, encoding="cp949")
+        except Exception:
+            df = pd.read_csv(self.signals_csv, engine="python")
         cols = {c.lower(): c for c in df.columns}
-        need = ["ts", "symbol", "event"]
-        if not all(x in [k.lower() for k in df.columns] for x in need):
-            # 헤더가 포함되지 않은 chunk일 수 있으므로 전체파일 재파싱 폴백
-            try:
-                full = pd.read_csv(self.signals_csv)
-                cols = {c.lower(): c for c in full.columns}
-                if not all(k in cols for k in ["ts","symbol","event"]):
-                    logging.warning("signals csv missing required columns: ts,symbol,event")
-                    return pd.DataFrame()
-                return full.tail(1000)  # 최근부 1000행만
-            except Exception as e:
-                logging.warning(f"parse signals fallback failed: {e}")
-                return pd.DataFrame()
 
-        # 최소 컬럼 lower-key로 접근
-        def col(name):  # name is lower
-            return df[cols[name]] if name in cols else None
+        def pick(*names):
+            for n in names:
+                if n in cols:
+                    return cols[n]
+            return None
+
+        c_ts = pick("ts","timestamp","time","datetime")
+        c_sym = pick("symbol","ticker","market")
+        c_evt = pick("event","signal","type")
+        c_dist = pick("distance_pct","distance","dist_pct","dist")
+        c_price = pick("price","close","entry_price")
+
+        # 최소 ts/symbol/event는 필요
+        if not c_ts or not c_sym or not c_evt:
+            return pd.DataFrame(columns=["ts","symbol","event","distance_pct","price"])
 
         out = pd.DataFrame({
-            "ts": col("ts"),
-            "symbol": col("symbol"),
-            "event": col("event")
-        }).copy()
+            "ts": df[c_ts],
+            "symbol": df[c_sym],
+            "event": df[c_evt],
+        })
+        out["distance_pct"] = df[c_dist] if c_dist else None
+        out["price"] = df[c_price] if c_price else None
 
-        out["strategy"] = col("strategy") if "strategy" in cols else self.default_strategy
-        out["side"] = (col("side").astype(str).str.lower()
-                       if "side" in cols else ("long" if self.long_only else "long"))
-        # expiry_h는 없으면 None 두고, 오픈 때 엔진 설정(expiries_h 또는 quick)로 확장
-        out["expiry_h"] = (pd.to_numeric(col("expiry_h"), errors="coerce")
-                           if "expiry_h" in cols else None)
-
-        # ts 파싱/UTC
-        try:
-            out["signal_dt"] = out["ts"].map(parse_ts_any)
-        except Exception as e:
-            logging.warning(f"signal ts parse error: {e}")
-            out["signal_dt"] = now_utc()
-
-        # 불필요/결측 제거
-        out = out.dropna(subset=["ts", "symbol", "event"])
+        # ts 파싱
+        out["ts_dt"] = out["ts"].apply(parse_ts_any)
+        out = out[out["ts_dt"].notna()].copy()
+        # UTC 정렬
+        out.sort_values("ts_dt", inplace=True)
         return out
 
-    # ---------- entry from signals ----------
-    def _open_from_signals(self):
-        """
-        신규 시그널을 읽어 만기 리스트(expiries_h 혹은 quick)별로 포지션 오픈.
-        - long_only면 side를 long으로 강제
-        - 동일 (symbol,event,expiry_h,strategy) key의 오픈 포지션이 이미 있거나
-          최근 쿨다운 내에 같은 key가 생성되었으면 skip
-        """
-        csv_text = self._read_new_signal_lines()
-        if csv_text is None:
-            return  # 신규 없음
-
-        sig_df = self._parse_signals_csv_text(csv_text)
+    def _filter_signals(self, sig_df: pd.DataFrame) -> pd.DataFrame:
         if sig_df.empty:
-            return
+            return sig_df
 
+        nowdt = now_utc()
+        # 최근 N초 윈도우
+        if self.signals_recent_sec and self.signals_recent_sec > 0:
+            cutoff = nowdt - timedelta(seconds=self.signals_recent_sec)
+            sig_df = sig_df[sig_df["ts_dt"] >= cutoff]
+
+        # 백로그 가드: state.last_processed_ts 이후만
+        if self.state.get("last_processed_ts"):
+            last_dt = parse_ts_any(self.state["last_processed_ts"])
+            if last_dt:
+                sig_df = sig_df[sig_df["ts_dt"] > last_dt]
+
+        # 이벤트 화이트리스트
+        if self.allow_events:
+            sig_df = sig_df[sig_df["event"].astype(str).str.lower().isin(self.allow_events)]
+
+        # 거리 필터
+        if self.min_distance_pct is not None:
+            sig_df = sig_df[(sig_df["distance_pct"].astype(float) >= self.min_distance_pct)]
+        if self.max_distance_pct is not None:
+            sig_df = sig_df[(sig_df["distance_pct"].astype(float) <= self.max_distance_pct)]
+
+        # 심볼 쿨다운 (state.cooldown 에 마지막 오픈시각 보관)
+        cd = self.state.get("cooldown", {})
+        keep_rows = []
+        for _, r in sig_df.iterrows():
+            sym = str(r["symbol"])
+            last_open_iso = cd.get(sym)
+            ok = True
+            if last_open_iso:
+                last_open_dt = parse_ts_any(last_open_iso)
+                if last_open_dt and (nowdt - last_open_dt).total_seconds() < self.cooldown_sec:
+                    ok = False
+            if ok:
+                keep_rows.append(r)
+        sig_df = pd.DataFrame(keep_rows) if keep_rows else pd.DataFrame(columns=sig_df.columns)
+
+        return sig_df
+
+    # ---------- open trades from signals ----------
+    def _open_from_signals(self):
+        if not self.signals_csv:
+            return 0
+
+        raw = self._load_signals_df()
+        if raw.empty:
+            return 0
+        cand = self._filter_signals(raw)
+        if cand.empty:
+            return 0
+
+        # 동시보유 상한 확인
         open_df = self._read_open()
+        current_open = 0 if open_df.empty else len(open_df)
+        capacity = max(self.max_open_positions - current_open, 0)
+        if capacity <= 0:
+            return 0
 
-        # 최근 생성 내역(쿨다운 확인용) - open_df의 entry_ts를 사용
-        def recent_exists(key: Tuple[str, str, float, str], ref_dt: datetime) -> bool:
-            sym, evt, eh, strat = key
-            if open_df.empty:
-                return False
-            try:
-                mask = (
-                    (open_df["symbol"] == sym) &
-                    (open_df["event"] == evt) &
-                    (open_df["strategy"] == strat) &
-                    (open_df["expiry_h"].astype(float) == float(eh))
-                )
-                sub = open_df.loc[mask]
-                if sub.empty:
-                    return False
-                # 쿨다운 확인
-                for _, r in sub.iterrows():
-                    et = parse_ts_any(str(r["entry_ts"]))
-                    if (ref_dt - et).total_seconds() < self.cooldown_sec:
-                        return True
-                return False
-            except Exception:
-                return False
+        # 틱당 오픈 상한 & 동시보유 cap 동시 적용
+        budget = min(self.max_opens_per_tick, capacity)
 
-        # 준비
-        created = 0
-        now_s = ts_str(now_utc())
-        # 어떤 만기를 적용할지
-        expiries = [self.quick_expiry_secs / 3600.0] if (self.quick_expiry_secs and self.quick_expiry_secs > 0) else self.expiries_h
+        opened = 0
+        rows = []
+        # 최신 신호 우선 (가장 최근부터)
+        cand = cand.sort_values("ts_dt", ascending=True)  # 오래된→새로운 순으로 훑고 마지막 처리 ts 업데이트
 
-        # 시그널 루프
-        for _, s in sig_df.iterrows():
-            sym = str(s["symbol"])
-            evt = str(s["event"])
-            strat = str(s.get("strategy", self.default_strategy))
-            side = "long" if self.long_only else str(s.get("side", "long")).lower()
-            if self.long_only and side != "long":
-                side = "long"
+        for _, r in cand.iterrows():
+            if opened >= budget:
+                break
+            sym = str(r["symbol"])
+            evt = str(r["event"]).lower()
+            # side: long-only면 long만
+            side = "long" if self.long_only else "long"  # 현재는 long만 사용
+            entry_price = float(r["price"]) if pd.notna(r["price"]) else 100.0
+            dist = float(r["distance_pct"]) if pd.notna(r["distance_pct"]) else 0.0
 
-            # 만기 리스트 확정: 시그널에 expiry_h가 있으면 그 값만, 없으면 엔진 만기들 전체
-            sig_eh = s.get("expiry_h", None)
-            if pd.notna(sig_eh):
-                use_expiries = [float(sig_eh)]
-            else:
-                use_expiries = [float(eh) for eh in expiries]
-
-            for eh in use_expiries:
-                key = (sym, evt, float(eh), strat)
-
-                # 이미 같은 만기의 오픈 포지션 존재?
-                exists = False
-                if not open_df.empty:
-                    try:
-                        exists = any(
-                            (open_df["symbol"] == sym)
-                            & (open_df["event"] == evt)
-                            & (open_df["strategy"] == strat)
-                            & (open_df["expiry_h"].astype(float) == float(eh))
-                        )
-                    except Exception:
-                        exists = False
-
-                if exists or recent_exists(key, s["signal_dt"]):
-                    continue  # 중복/쿨다운 skip
-
-                # 새 엔트리 생성
-                trade_id = f"S{int(time.time()*1000)}_{sym}_{evt}_{str(eh).replace('.','_')}"
-                entry_price = 100.0  # 실제 체결가격 연동은 후속단계(가격피드)에서
+            for eh in self.expiries_h:
+                if opened >= budget:
+                    break
                 expiry_sec = int(self.quick_expiry_secs if self.quick_expiry_secs else eh * 3600)
-
+                trade_id = f"T{int(time.time()*1000)}_{sym}_{str(eh).replace('.','_')}"
                 row = OpenTrade(
                     id=trade_id,
-                    strategy=strat,
+                    strategy="paper_live",
+                    expiry_h=eh,
+                    side=side,
                     symbol=sym,
                     event=evt,
-                    expiry_h=float(eh),
-                    side=side,
-                    entry_ts=now_s,
+                    entry_ts=ts_to_str_utc(r["ts_dt"]),
                     entry_price=entry_price,
                     expiry_sec=expiry_sec,
-                    signal_ts=ts_str(s["signal_dt"]),
+                    distance_pct=dist,
                 )
+                rows.append(asdict(row))
+                opened += 1
 
-                new_row = pd.DataFrame([asdict(row)])
-                frames = [df for df in (open_df, new_row) if not df.empty]
-                open_df = pd.concat(frames, ignore_index=True) if frames else new_row
-                created += 1
+                # cooldown 갱신
+                self.state.setdefault("cooldown", {})[sym] = ts_to_str_utc(now_utc())
 
-        if created:
-            self._write_open(open_df)
-            logging.info(f"opened {created} trade(s) from signals")
+                if opened >= budget:
+                    break
 
-    # ---------- close on expiry ----------
+        if rows:
+            new_df = pd.DataFrame(rows)
+            if open_df.empty:
+                out_df = new_df
+            else:
+                out_df = pd.concat([open_df, new_df], ignore_index=True)
+            self._write_open(out_df)
+
+        # 처리한 신호의 최종 ts를 state에 저장(백로그 가드)
+        last_ts = cand["ts_dt"].max()
+        if last_ts is not None:
+            self.state["last_processed_ts"] = ts_to_str_utc(last_ts)
+            self._save_state()
+
+        if opened:
+            logging.info(f"opened {opened} trade(s) from signals")
+        return opened
+
+    # ---------- close expired ----------
     def _close_expired(self):
         open_df = self._read_open()
         if open_df.empty:
-            return
+            return 0
 
-        # long-only 보호
-        if self.long_only and "side" in open_df.columns:
-            before = len(open_df)
-            open_df = open_df[open_df["side"].astype(str).str.lower() == "long"].copy()
-            purged = before - len(open_df)
-            if purged > 0:
-                logging.info(f"purged {purged} short open trade(s) before close (long-only mode)")
-                self._write_open(open_df)
-
-        now_dt = now_utc()
+        nowdt = now_utc()
         remaining = []
         closed_rows: List[ClosedTrade] = []
 
         for _, r in open_df.iterrows():
-            entry_dt = parse_ts_any(str(r["entry_ts"]))
+            entry_dt = parse_ts_any(r["entry_ts"])
             expiry_td = timedelta(seconds=int(r["expiry_sec"]))
-            if now_dt >= entry_dt + expiry_td:
-                # 더미 PnL: ±0.1~0.3%
-                drift = random.uniform(0.001, 0.003)
-                sign = 1 if random.random() < 0.55 else -1
-                pnl = sign * drift
-                exit_price = float(r["entry_price"]) * (1.0 + pnl)
+            if entry_dt and nowdt >= entry_dt + expiry_td:
+                # 더미 가격변화: 만기 짧을수록 분산↑ (0.5h ~ 2h 백테 감성 반영 살짝)
+                eh = float(r["expiry_h"])
+                base = 0.0025 if eh <= 0.5 else (0.0020 if eh <= 1.0 else 0.0016)
+                drift = random.uniform(0.5 * base, 1.2 * base)
+                sign = 1 if random.random() < 0.6 else -1  # 승률 60% 근방
+                pnl_gross = sign * drift
+
+                fee_round = 2.0 * self.fee
+                pnl_net = pnl_gross - fee_round
+                entry_price = float(r["entry_price"])
+                exit_price = entry_price * (1.0 + pnl_gross)
 
                 closed = ClosedTrade(
-                    id=str(r["id"]),
+                    id=r["id"],
                     strategy=str(r["strategy"]),
-                    symbol=str(r["symbol"]),
-                    event=str(r["event"]),
                     expiry_h=float(r["expiry_h"]),
                     side=str(r["side"]),
+                    symbol=str(r["symbol"]),
+                    event=str(r["event"]),
                     entry_ts=str(r["entry_ts"]),
-                    exit_ts=ts_str(now_dt),
-                    entry_price=float(r["entry_price"]),
+                    exit_ts=ts_to_str_utc(nowdt),
+                    entry_price=entry_price,
                     exit_price=exit_price,
-                    pnl=pnl,
+                    pnl_gross=pnl_gross,
+                    fee_round=fee_round,
+                    pnl_net=pnl_net,
                     status="expired",
                 )
                 closed_rows.append(closed)
             else:
                 remaining.append(r)
 
+        # 기록 갱신
+        n_closed = 0
         if closed_rows:
             self._append_closed(closed_rows)
-            logging.info(f"closed {len(closed_rows)} trade(s)")
+            n_closed = len(closed_rows)
+            logging.info(f"closed {n_closed} trade(s)")
 
         if remaining:
             self._write_open(pd.DataFrame(remaining))
         else:
+            # 모두 닫혔으면 빈 프레임으로 초기화
             self._write_open(pd.DataFrame(columns=[
-                "id","strategy","symbol","event","expiry_h","side",
-                "entry_ts","entry_price","expiry_sec","signal_ts"
+                "id","strategy","expiry_h","side","symbol","event",
+                "entry_ts","entry_price","expiry_sec","distance_pct"
             ]))
+        return n_closed
 
     # ---------- main ticks ----------
     def run_once(self):
-        # 1) 시그널 ingest → open
+        # 1) 신호 기반 신규 오픈 (필터/제약 적용, 백로그 가드)
         self._open_from_signals()
-        # 2) 만기 도달 → close
+        # 2) 만기 도달한 포지션 종료
         self._close_expired()
 
     def loop(self, interval_sec: int, stop_at: Optional[datetime] = None):
         logging.info("engine loop started")
         try:
-            while self.running:
+            while True:
                 self.run_once()
                 if stop_at and now_utc() >= stop_at:
                     logging.info("timebox reached; exiting")
@@ -429,21 +469,35 @@ class PaperEngine:
             self.close()
 
     def close(self):
-        self.running = False
         logging.info("engine closed")
 
 # ------------------------- CLI -------------------------
 def parse_args():
     p = argparse.ArgumentParser()
+    # 모드
     p.add_argument("--once", action="store_true", help="Run one tick and exit")
     p.add_argument("--run-for", type=int, default=None, help="Run for N minutes")
     p.add_argument("--interval", type=int, default=10, help="Loop interval seconds")
+
+    # 만기
     p.add_argument("--expiries", type=str, default="0.5,1,2", help="Expiry hours list, e.g. '0.5,1,2'")
     p.add_argument("--quick-expiry-secs", type=int, default=None, help="Quick test expiry seconds (e.g. 36)")
-    p.add_argument("--allow-short", action="store_true", help="Allow short signals (default: long-only)")
-    p.add_argument("--signals-csv", type=str, default=None, help="Path to signals CSV (default: logs/signals_tv.csv)")
-    p.add_argument("--strategy-name", type=str, default="tv_signal", help="Default strategy name when CSV lacks 'strategy'")
-    p.add_argument("--cooldown-sec", type=int, default=60, help="Cooldown seconds per (symbol,event,expiry,strategy)")
+
+    # 신호
+    p.add_argument("--signals-csv", type=str, default=None, help="Path to signals csv")
+    p.add_argument("--long-only", action="store_true", help="Open only long positions (recommended)")
+
+    # 백테 조건 이식
+    p.add_argument("--signals-recent-sec", type=int, default=60, help="Only accept signals within last N seconds")
+    p.add_argument("--min-distance-pct", type=float, default=None)
+    p.add_argument("--max-distance-pct", type=float, default=None)
+    p.add_argument("--allow-events", type=str, default=None, help="Comma list, e.g. 'box_breakout,line_breakout'")
+    p.add_argument("--cooldown-sec", type=int, default=300)
+    p.add_argument("--max-opens-per-tick", type=int, default=3)
+    p.add_argument("--max-open-positions", type=int, default=30)
+
+    # 수수료/리스크(더미 체결에 수수료 반영)
+    p.add_argument("--fee", type=float, default=0.001, help="Per-side fee (0.001 = 0.1%)")
     return p.parse_args()
 
 def main():
@@ -457,6 +511,7 @@ def main():
     args = parse_args()
     root = os.getcwd()
 
+    # expiries
     if args.quick_expiry_secs and args.quick_expiry_secs > 0:
         expiries_h = [args.quick_expiry_secs / 3600.0]
         note = f"(quick={args.quick_expiry_secs}s)"
@@ -464,19 +519,29 @@ def main():
         expiries_h = [float(x) for x in str(args.expiries).split(",") if x.strip()]
         note = ""
 
-    long_only = not args.allow_short
+    # events whitelist
+    allow_events = None
+    if args.allow_events:
+        allow_events = [x.strip().lower() for x in args.allow_events.split(",") if x.strip()]
+
     logging.info(f"expiries_h={expiries_h} {note}")
-    logging.info(f"long_only={long_only}")
+    logging.info(f"long_only={bool(args.long_only)}")
 
     eng = PaperEngine(
         root=root,
         expiries_h=expiries_h,
+        signals_csv=args.signals_csv,
+        long_only=bool(args.long_only),
+        signals_recent_sec=args.signals_recent_sec,
+        min_distance_pct=args.min_distance_pct,
+        max_distance_pct=args.max_distance_pct,
+        allow_events=allow_events,
+        cooldown_sec=args.cooldown_sec,
+        max_opens_per_tick=args.max_opens_per_tick,
+        max_open_positions=args.max_open_positions,
+        fee=args.fee,
         quick_expiry_secs=args.quick_expiry_secs,
         interval=args.interval,
-        long_only=long_only,
-        signals_csv=args.signals_csv,
-        default_strategy=args.strategy_name,
-        cooldown_sec=args.cooldown_sec,
     )
 
     if args.once:
