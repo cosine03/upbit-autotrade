@@ -1,400 +1,241 @@
-# paper_trader.py
-import os, sys, time, csv, json, hashlib, logging
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
-import pandas as pd
-from datetime import timedelta
+<# 
+run_daily_report_and_email.ps1
+- AM/PM 리포트 생성(+옵션 파이프라인) 후 HTML 메일 발송
+- 본문: Merged / Breakout / Box-Line 각 Top10 (퍼센트 P2로 표기)
+- 카카오 알림 미리보기: text/plain + text/html 멀티파트
+- 로그: logs\reports\email_YYYY-MM-DD_{AM|PM}.log
+#>
 
-# ========= CONFIG =========
-SIGNAL_CSV_PATH = r"logs/signals_tv.csv"   # 시그널 CSV (헤더 포함)
-SIGNAL_POLL_SEC = 5                        # 시그널 폴링 주기(초)
-FEE_BPS = 10                               # 0.10% (왕복은 2번 발생)
-SLIPPAGE_BPS = 2                           # 0.02% (진입/청산 시 적용)
-DEFAULT_RISK_PCT = 0.01                    # 포지션당 1% 리스크
-EXPIRIES_H_DEFAULT = [0.5, 1.0, 2.0]       # 만기 후보 (시간)
-PRICE_FEED_CSV = r"logs/price_feed.csv"    # price feed 모드에서 읽을 파일(ts,symbol,price)
+param(
+  [ValidateSet("AM","PM")]
+  [string]$TagHalf = "AM",
+  [switch]$RunPipeline = $false
+)
 
-STATE_DIR = "state"
-LOG_DIR = "logs/paper_trading"
-LAST_OFF_FP = os.path.join(STATE_DIR, "last_signal_offset.json")
-SEEN_KEYS_FP = os.path.join(STATE_DIR, "seen_signal_keys.json")
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
-TRADES_FP = os.path.join(LOG_DIR, "trades.csv")            # 체결 로그(개별 fill)
-POSITIONS_FP = os.path.join(LOG_DIR, "positions.csv")      # 포지션 단위 오픈/클로즈 기록
-EQUITY_FP = os.path.join(LOG_DIR, "equity.csv")            # 에쿼티 타임라인
-EXPIRY_STATS_FP = os.path.join(LOG_DIR, "expiry_stats.csv")# 만기별 누적 성과
+# ---------- 경로/날짜 ----------
+$Root       = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $Root
+$DATE       = Get-Date -Format "yyyy-MM-dd"
+$DailyDir   = Join-Path $Root "logs\daily\${DATE}_$TagHalf"
+$ReportsDir = Join-Path $Root "logs\reports"
+if (-not (Test-Path $ReportsDir)) { New-Item -ItemType Directory -Force -Path $ReportsDir | Out-Null }
 
-# ========= UTILS =========
-def ensure_dirs(*paths):
-    for p in paths:
-        os.makedirs(p, exist_ok=True)
+# ---------- 로깅 ----------
+$EmailLog = Join-Path $ReportsDir ("email_{0}_{1}.log" -f $DATE, $TagHalf)
+function Write-Log([string]$msg) {
+  $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+  $line  = "[{0}] {1}" -f $stamp, $msg
+  $line | Tee-Object -FilePath $EmailLog -Append | Out-Null
+}
+Write-Log "== RUN START == Root=$Root Half=$TagHalf =="
 
-def now_utc():
-    # tz-aware UTC timestamp
-    return pd.Timestamp.now(tz="UTC")
+# ---------- .env ----------
+$DotEnv = Join-Path $Root ".env"
+if (Test-Path -LiteralPath $DotEnv) {
+  Get-Content $DotEnv | ForEach-Object {
+    $line = $_.Trim()
+    if (-not $line -or $line -match '^\s*#') { return }
+    if ($line.Contains('#')) { $line = $line.Split('#')[0].Trim(); if (-not $line) { return } }
+    $kv = $line.Split('=',2); if ($kv.Count -ne 2) { return }
+    $k=$kv[0].Trim(); $v=$kv[1].Trim()
+    if (($v.StartsWith('"') -and $v.EndsWith('"')) -or ($v.StartsWith("'") -and $v.EndsWith("'"))) { $v=$v.Substring(1,$v.Length-2) }
+    if ($k) { Set-Item -Path ("Env:{0}" -f $k) -Value $v }
+  }
+  Write-Log ".env loaded."
+} else {
+  Write-Log "[WARN] .env not found: $DotEnv"
+}
 
-def bps(v: float) -> float:
-    return v / 1e4
+# ---------- 파일 ----------
+$BtDirBreakout   = Join-Path $DailyDir "bt_breakout_only"
+$BtDirBoxLine    = Join-Path $DailyDir "bt_boxin_linebreak"
+$BreakoutSummary = Join-Path $BtDirBreakout "bt_tv_events_stats_summary.csv"
+$BoxLineSummary  = Join-Path $BtDirBoxLine  "bt_tv_events_stats_summary.csv"
+$MergedSummary   = Join-Path $DailyDir ("bt_stats_summary_merged_{0}.csv" -f $TagHalf)
 
-def parse_expiries_arg(s: Optional[str]) -> List[float]:
-    if not s:
-        return EXPIRIES_H_DEFAULT
-    out = []
-    for tok in s.split(","):
-        tok = tok.strip().lower().replace("h","")
-        if tok:
-            out.append(float(tok))
-    return out or EXPIRIES_H_DEFAULT
+Write-Log ("[CHECK] exists merged={0} breakout={1} boxline={2}" -f `
+  ($(if (Test-Path $MergedSummary) {1}else{0}),
+   $(if (Test-Path $BreakoutSummary){1}else{0}),
+   $(if (Test-Path $BoxLineSummary) {1}else{0})))
 
-def to_float(x, default=0.0):
-    try:
-        if x is None: return default
-        return float(x)
-    except Exception:
-        return default
+# ---------- 파이프라인(옵션) ----------
+if ($RunPipeline) {
+  try {
+    Write-Log "[PIPE] start"
+    if (-not (Test-Path $DailyDir)) { New-Item -ItemType Directory -Force -Path $DailyDir | Out-Null }
+    if ((Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
+      $b=Import-Csv $BreakoutSummary
+      $l=Import-Csv $BoxLineSummary
+      $b | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "breakout_only" -Force }
+      $l | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "boxin_linebreak" -Force }
+      ($b+$l) | Export-Csv -NoTypeInformation -Encoding UTF8 $MergedSummary
+      Write-Log "merged summary saved -> $MergedSummary"
+    } else {
+      Write-Log "[PIPE][WARN] summary files missing; skip merge."
+    }
+    Write-Log "[PIPE] done"
+  } catch {
+    Write-Log "[PIPE][ERROR] $($_.Exception.Message)"
+  }
+} else {
+  if ((-not (Test-Path $MergedSummary)) -and (Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
+    try {
+      $b=Import-Csv $BreakoutSummary
+      $l=Import-Csv $BoxLineSummary
+      $b | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "breakout_only" -Force }
+      $l | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "boxin_linebreak" -Force }
+      ($b+$l) | Export-Csv -NoTypeInformation -Encoding UTF8 $MergedSummary
+      Write-Log "merged summary saved -> $MergedSummary"
+    } catch { Write-Log "[MERGE][ERROR] $($_.Exception.Message)" }
+  }
+}
 
-def sig_key(row: Dict) -> str:
-    base = f"{row.get('symbol','')}|{row.get('event','')}|{row.get('ts','')}|{row.get('id','')}"
-    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+# ---------- 메일 설정 ----------
+$SMTP_HOST = if ($env:SMTP_HOST) { $env:SMTP_HOST } else { 'smtp.gmail.com' }
+$SMTP_PORT = if ($env:SMTP_PORT) { [int]$env:SMTP_PORT } else { 587 }
+$SMTP_USER = $env:SMTP_USER
+$SMTP_PASS = $env:SMTP_PASS
+$MAIL_FROM = if ($env:MAIL_FROM) { $env:MAIL_FROM } else { $SMTP_USER }
+$MAIL_TO   = $env:MAIL_TO
 
-# ========= SIGNAL FEED =========
-class SignalFeed:
-    def __init__(self, csv_path=SIGNAL_CSV_PATH, state_dir=STATE_DIR, last_off_fp=LAST_OFF_FP, seen_fp=SEEN_KEYS_FP):
-        self.csv_path = csv_path
-        self.last_off_fp = last_off_fp
-        self.seen_fp = seen_fp
-        ensure_dirs(state_dir)
-        self._offset = 0
-        self._seen = set()
-        self._load_state()
+# ---------- 표 HTML 유틸 ----------
+Add-Type -AssemblyName System.Web
+function New-TopHtml {
+  param(
+    [Parameter(Mandatory)][string]$CsvPath,
+    [int]$Top = 10,
+    [string]$Title = ""
+  )
+  if (-not (Test-Path -LiteralPath $CsvPath)) { return "<p style='color:#999;'>${Title}: file not found</p>" }
+  $rows = Import-Csv $CsvPath | Select-Object event,expiry_h,trades,win_rate,avg_net,median_net,total_net,strategy
+  if (-not $rows) { return "<p style='color:#999;'>${Title}: no rows</p>" }
 
-    def _load_state(self):
-        try:
-            with open(self.last_off_fp, "r", encoding="utf-8") as f:
-                self._offset = json.load(f).get("offset", 0)
-        except Exception:
-            self._offset = 0
-        try:
-            with open(self.seen_fp, "r", encoding="utf-8") as f:
-                self._seen = set(json.load(f).get("seen", []))
-        except Exception:
-            self._seen = set()
+  $rows = $rows | Select-Object `
+    event,expiry_h,trades,
+    @{n='win_rate';e={[double]$_.win_rate}},
+    @{n='avg_net';e={[double]$_.avg_net}},
+    @{n='median_net';e={[double]$_.median_net}},
+    @{n='total_net';e={[double]$_.total_net}},
+    strategy |
+    Sort-Object -Property total_net -Descending | Select-Object -First $Top
 
-    def _save_state(self):
-        with open(self.last_off_fp, "w", encoding="utf-8") as f:
-            json.dump({"offset": self._offset}, f)
-        with open(self.seen_fp, "w", encoding="utf-8") as f:
-            json.dump({"seen": list(self._seen)}, f)
+  $cols = 'event','expiry_h','trades','win_rate','avg_net','median_net','total_net','strategy'
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.AppendLine("<h3 style='margin:16px 0 8px'>$([System.Web.HttpUtility]::HtmlEncode($Title))</h3>")
+  [void]$sb.AppendLine("<table style='border-collapse:collapse;width:860px'>")
+  [void]$sb.AppendLine("<thead><tr>")
+  foreach ($c in $cols) {
+    [void]$sb.AppendLine("<th style='padding:6px 8px;border:1px solid #ddd;background:#f7f7f7;text-align:left;'>$([System.Web.HttpUtility]::HtmlEncode($c))</th>")
+  }
+  [void]$sb.AppendLine("</tr></thead><tbody>")
+  foreach ($r in $rows) {
+    [void]$sb.AppendLine("<tr>")
+    foreach ($c in $cols) {
+      $v = $r.$c
+      if ($c -in @('win_rate','avg_net','median_net','total_net')) {
+        $v = ([double]$v).ToString("P2", [System.Globalization.CultureInfo]::InvariantCulture)
+      }
+      [void]$sb.AppendLine("<td style='padding:6px 8px;border:1px solid #ddd;'>$([System.Web.HttpUtility]::HtmlEncode([string]$v))</td>")
+    }
+    [void]$sb.AppendLine("</tr>")
+  }
+  [void]$sb.AppendLine("</tbody></table>")
+  $sb.ToString()
+}
 
-    def poll(self) -> List[Dict]:
-        """파일 뒤에서부터 신규 레코드 읽어 반환"""
-        if not os.path.exists(self.csv_path):
-            return []
-        new = []
-        with open(self.csv_path, "r", encoding="utf-8", newline="") as f:
-            f.seek(self._offset, os.SEEK_SET)
-            reader = csv.DictReader(f)
-            for row in reader:
-                k = sig_key(row)
-                if k in self._seen:
-                    continue
-                self._seen.add(k)
-                new.append(row)
-            self._offset = f.tell()
-        if new:
-            self._save_state()
-        return new
+# ---------- 본문 ----------
+$Subject = "[Autotrade] Daily Report $DATE $TagHalf"
 
-# ========= PRICE SOURCE =========
-class PriceSource:
-    """
-    price_mode:
-      - const    : 1.0 고정 (기본)
-      - signals  : 시그널 row의 price 컬럼 사용(없으면 1.0)
-      - feed     : logs/price_feed.csv 최신가 사용(없으면 직전가 또는 1.0)
-    """
-    def __init__(self, mode="const", feed_csv=PRICE_FEED_CSV):
-        self.mode = mode
-        self.feed_csv = feed_csv
-        self.last_price_by_sym: Dict[str, float] = {}
+$MergedHtml   = New-TopHtml -CsvPath $MergedSummary   -Top 10 -Title "Merged Summary (Top 10)"
+$BreakoutHtml = New-TopHtml -CsvPath $BreakoutSummary -Top 10 -Title "Breakout Summary (Top 10)"
+$BoxLineHtml  = New-TopHtml -CsvPath $BoxLineSummary  -Top 10 -Title "Box-Line Summary (Top 10)"
 
-    def from_signal(self, sym: str, sig_row: Dict) -> float:
-        if self.mode == "signals":
-            px = to_float(sig_row.get("price"), default=1.0)
-            if px > 0:
-                self.last_price_by_sym[sym] = px
-                return px
-        if self.mode == "feed":
-            px = self._from_feed(sym)
-            if px > 0:
-                self.last_price_by_sym[sym] = px
-                return px
-        # const or fallback
-        px = self.last_price_by_sym.get(sym, 1.0 if self.mode=="const" else 1.0)
-        self.last_price_by_sym[sym] = px
-        return px
+$PreviewText = @"
+Autotrade Daily Report ($DATE $TagHalf)
+Attachments: 3
+This is an HTML email with CSV attachments.
+"@.Trim()
 
-    def latest(self, sym: str) -> float:
-        if self.mode == "feed":
-            px = self._from_feed(sym)
-            if px > 0:
-                self.last_price_by_sym[sym] = px
-                return px
-        return self.last_price_by_sym.get(sym, 1.0 if self.mode=="const" else 1.0)
+$BodyHtml = @"
+<!doctype html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>$([System.Web.HttpUtility]::HtmlEncode($Subject))</title>
+<style>
+  body{font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#e8e8e8;background:#121212}
+  a{color:#8ab4f8}
+  .wrap{max-width:900px;margin:0 auto;padding:16px 8px}
+  h2{margin:0 0 12px}
+  p{margin:6px 0}
+  table{border-collapse:collapse;width:100%;margin:8px 0}
+  th,td{border:1px solid #2a2a2a;padding:6px 8px}
+  thead th{background:#1f1f1f}
+  .muted{color:#bdbdbd}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>Autotrade Daily Report ($DATE $TagHalf)</h2>
+  <p class="muted">Attachments: 3</p>
+  $MergedHtml
+  $BreakoutHtml
+  $BoxLineHtml
+  <p class="muted">Log: $([System.Web.HttpUtility]::HtmlEncode((Resolve-Path $EmailLog).Path))</p>
+</div>
+</body>
+</html>
+"@
 
-    def _from_feed(self, sym: str) -> float:
-        try:
-            if not os.path.exists(self.feed_csv):
-                return self.last_price_by_sym.get(sym, 1.0)
-            df = pd.read_csv(self.feed_csv)
-            df = df[df["symbol"] == sym]
-            if df.empty:
-                return self.last_price_by_sym.get(sym, 1.0)
-            px = float(df.iloc[-1]["price"])
-            return px if px > 0 else self.last_price_by_sym.get(sym, 1.0)
-        except Exception:
-            return self.last_price_by_sym.get(sym, 1.0)
+# ---------- 수신자/첨부 ----------
+$ToList = @()
+if ($MAIL_TO) { $MAIL_TO.Split(',;') | ForEach-Object { $a=$_.Trim(); if ($a) { $ToList += $a } } }
+if (-not $ToList) { Write-Log "[MAIL][ERROR] MAIL_TO empty."; throw "MAIL_TO empty" }
 
-# ========= DATA MODELS =========
-@dataclass
-class Position:
-    id: str
-    symbol: str
-    side: str              # BUY / SELL
-    qty: float
-    entry_px: float
-    entry_ts: pd.Timestamp
-    expiry_h: float
-    expiry_ts: pd.Timestamp
-    fee_entry: float
-    meta: Dict
+$Attachments = @()
+foreach ($p in @($MergedSummary, $BreakoutSummary, $BoxLineSummary)) {
+  if (Test-Path -LiteralPath $p) { $Attachments += (Resolve-Path $p).Path } else { Write-Log "[ATTACH][WARN] not found -> $p" }
+}
 
-@dataclass
-class CloseResult:
-    pos_id: str
-    symbol: str
-    side: str
-    qty: float
-    entry_px: float
-    exit_px: float
-    entry_ts: pd.Timestamp
-    exit_ts: pd.Timestamp
-    expiry_h: float
-    pnl: float
-    fee_entry: float
-    fee_exit: float
-    meta: Dict
+# ---------- 메일 발송 ----------
+$enc  = [System.Text.Encoding]::UTF8
+$msg  = New-Object System.Net.Mail.MailMessage
+$msg.From = $MAIL_FROM
+foreach ($t in $ToList) { [void]$msg.To.Add($t) }
+$msg.Subject         = $Subject
+$msg.SubjectEncoding = $enc
+$msg.IsBodyHtml      = $false
 
-# ========= PAPER ENGINE =========
-class PaperEngine:
-    def __init__(self, root_dir=".", shadow=False, interval_sec=10,
-                 price_mode="const", expiries: Optional[List[float]]=None):
-        ensure_dirs(LOG_DIR, STATE_DIR)
-        self.root = root_dir
-        self.shadow = shadow
-        self.interval_sec = interval_sec
-        self.log = logging.getLogger("PaperEngine")
-        self.log.setLevel(logging.INFO)
-        if not self.log.handlers:
-            ch = logging.StreamHandler(sys.stdout)
-            ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-            self.log.addHandler(ch)
+$altText = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($PreviewText, $enc, "text/plain")
+$altText.TransferEncoding = [System.Net.Mime.TransferEncoding]::QuotedPrintable
+$altHtml = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($BodyHtml, $enc, "text/html")
+$altHtml.TransferEncoding = [System.Net.Mime.TransferEncoding]::QuotedPrintable
+$msg.AlternateViews.Add($altText)
+$msg.AlternateViews.Add($altHtml)
 
-        self._equity = 1.0
-        self.signal_feed = SignalFeed()
-        self.price = PriceSource(mode=price_mode)
-        self.expiries = expiries or EXPIRIES_H_DEFAULT
-        self.open_positions: Dict[str, Position] = {}
+foreach ($p in $Attachments) {
+  $att = New-Object System.Net.Mail.Attachment($p)
+  if ($att.PSObject.Properties.Name -contains 'NameEncoding') { $att.NameEncoding = $enc }
+  $msg.Attachments.Add($att) | Out-Null
+}
 
-        # 파일 초기화
-        if not os.path.exists(EQUITY_FP):
-            pd.DataFrame([{"ts": now_utc(), "equity": self._equity}]).to_csv(EQUITY_FP, index=False)
-        if not os.path.exists(EXPIRY_STATS_FP):
-            pd.DataFrame([{
-                "date": pd.Timestamp.now(tz="UTC").date(),
-                "expiry_h": "init",
-                "trades": 0, "wins": 0, "win_rate": 0.0, "avg_net": 0.0, "total_net": 0.0
-            }]).to_csv(EXPIRY_STATS_FP, index=False)
+$smtp = New-Object System.Net.Mail.SmtpClient($SMTP_HOST, $SMTP_PORT)
+$smtp.EnableSsl = $true
+if ($SMTP_USER -and $SMTP_PASS) { $smtp.Credentials = New-Object System.Net.NetworkCredential($SMTP_USER, $SMTP_PASS) }
 
-    # ---- portfolio sizing ----
-    def _size_from_equity(self, price):
-        eq = float(self._equity)
-        qty = max(eq * DEFAULT_RISK_PCT / max(price, 1e-9), 0.0)
-        return round(qty, 6)
+try {
+  $smtp.Send($msg)
+  Write-Log ("[MAIL][OK] {0} sent to {1}" -f $Subject, ($ToList -join ", "))
+} catch {
+  Write-Log "[MAIL][ERROR] $($_.Exception.Message)"
+  throw
+} finally {
+  $msg.Dispose()
+  $smtp.Dispose()
+}
 
-    # ---- open/close ----
-    def _open_position(self, sym, side, qty, px, ts, expiry_h, meta):
-        fee = px * qty * bps(FEE_BPS)
-        pos_id = hashlib.md5(f"{sym}|{ts}|{px}|{expiry_h}|{side}".encode("utf-8")).hexdigest()[:16]
-        pos = Position(
-            id=pos_id, symbol=sym, side=side, qty=qty, entry_px=px, entry_ts=ts,
-            expiry_h=expiry_h, expiry_ts=ts + timedelta(hours=expiry_h),
-            fee_entry=fee, meta=meta or {}
-        )
-        self.open_positions[pos_id] = pos
-        # trade log (entry)
-        entry_row = {
-            "ts": ts, "pos_id": pos_id, "symbol": sym, "side": side, "qty": qty,
-            "price": px, "fee": fee, "type": "ENTRY", "expiry_h": expiry_h
-        }
-        pd.DataFrame([entry_row]).to_csv(TRADES_FP, mode="a", header=not os.path.exists(TRADES_FP), index=False)
-        if not self.shadow:
-            self._equity -= fee
-            pd.DataFrame([{"ts": ts, "equity": self._equity}]).to_csv(EQUITY_FP, mode="a", header=False, index=False)
-        self.log.info(f"OPEN {side} {sym} qty={qty} px={px:.6f} fee={fee:.6f} exp={expiry_h}h")
-
-    def _close_position(self, pos: Position, exit_px: float, exit_ts: pd.Timestamp) -> CloseResult:
-        fee_exit = exit_px * pos.qty * bps(FEE_BPS)
-        sign = 1 if pos.side == "BUY" else -1
-        pnl_gross = (exit_px - pos.entry_px) * pos.qty * sign
-        pnl_net = pnl_gross - pos.fee_entry - fee_exit - (pos.entry_px * pos.qty * bps(SLIPPAGE_BPS)) - (exit_px * pos.qty * bps(SLIPPAGE_BPS))
-        cr = CloseResult(
-            pos_id=pos.id, symbol=pos.symbol, side=pos.side, qty=pos.qty,
-            entry_px=pos.entry_px, exit_px=exit_px, entry_ts=pos.entry_ts, exit_ts=exit_ts,
-            expiry_h=pos.expiry_h, pnl=pnl_net, fee_entry=pos.fee_entry, fee_exit=fee_exit, meta=pos.meta
-        )
-        # trade log (exit)
-        exit_row = {
-            "ts": exit_ts, "pos_id": pos.id, "symbol": pos.symbol, "side": pos.side, "qty": pos.qty,
-            "price": exit_px, "fee": fee_exit, "type": "EXIT", "expiry_h": pos.expiry_h
-        }
-        pd.DataFrame([exit_row]).to_csv(TRADES_FP, mode="a", header=not os.path.exists(TRADES_FP), index=False)
-        # position log
-        pd.DataFrame([{
-            "pos_id": cr.pos_id, "symbol": cr.symbol, "side": cr.side, "qty": cr.qty,
-            "entry_px": cr.entry_px, "exit_px": cr.exit_px,
-            "entry_ts": cr.entry_ts, "exit_ts": cr.exit_ts,
-            "expiry_h": cr.expiry_h, "pnl": cr.pnl
-        }]).to_csv(POSITIONS_FP, mode="a", header=not os.path.exists(POSITIONS_FP), index=False)
-        if not self.shadow:
-            self._equity += cr.pnl - 0.0  # pnl에는 수수료/슬리피지 반영됨
-            pd.DataFrame([{"ts": exit_ts, "equity": self._equity}]).to_csv(EQUITY_FP, mode="a", header=False, index=False)
-        self.log.info(f"CLOSE {pos.side} {pos.symbol} exp={pos.expiry_h}h exit_px={exit_px:.6f} pnl={cr.pnl:.6f}")
-        return cr
-
-    # ---- stats ----
-    def _update_expiry_stats(self, closes: List[CloseResult]):
-        if not closes:
-            return
-        # 날짜 단위 집계 (UTC)
-        df = pd.DataFrame([{
-            "date": pd.Timestamp(c.exit_ts).tz_convert("UTC").date(),
-            "expiry_h": c.expiry_h,
-            "pnl": c.pnl
-        } for c in closes])
-        grp = df.groupby(["date", "expiry_h"]).agg(
-            trades=("pnl","count"),
-            wins=("pnl", lambda s: (s > 0).sum()),
-            avg_net=("pnl","mean"),
-            total_net=("pnl","sum")
-        ).reset_index()
-        # 기존 파일 로드 → 누적 업데이트
-        if os.path.exists(EXPIRY_STATS_FP):
-            cur = pd.read_csv(EXPIRY_STATS_FP)
-        else:
-            cur = pd.DataFrame(columns=["date","expiry_h","trades","wins","win_rate","avg_net","total_net"])
-        for _, r in grp.iterrows():
-            mask = (cur.get("date", pd.Series([])) == str(r["date"])) & (cur.get("expiry_h", pd.Series([])) == r["expiry_h"])
-            if mask.any():
-                idx = cur[mask].index[0]
-                cur.loc[idx, "trades"] = cur.loc[idx, "trades"] + int(r["trades"])
-                cur.loc[idx, "wins"]   = cur.loc[idx, "wins"] + int(r["wins"])
-                cur.loc[idx, "avg_net"] = ( (cur.loc[idx, "avg_net"] * (cur.loc[idx, "trades"]-int(r["trades"]))) + (r["avg_net"] * r["trades"]) ) / max(cur.loc[idx, "trades"],1)
-                cur.loc[idx, "total_net"] = cur.loc[idx, "total_net"] + r["total_net"]
-            else:
-                cur = pd.concat([cur, pd.DataFrame([{
-                    "date": str(r["date"]),
-                    "expiry_h": r["expiry_h"],
-                    "trades": int(r["trades"]),
-                    "wins": int(r["wins"]),
-                    "avg_net": float(r["avg_net"]),
-                    "total_net": float(r["total_net"])
-                }])], ignore_index=True)
-        # win_rate 업데이트
-        cur["win_rate"] = cur.apply(lambda x: (x["wins"]/x["trades"]) if x["trades"] else 0.0, axis=1)
-        cur.to_csv(EXPIRY_STATS_FP, index=False)
-
-    # ---- mapping ----
-    def _map_signal_to_orders(self, sig: Dict):
-        sym = sig.get("symbol", "KRW-BTC")
-        event = (sig.get("event","") or "").lower()
-        # 기본 방향: breakout=BUY, breakdown=SELL, 기타는 BUY
-        side = "BUY" if "breakout" in event else ("SELL" if "breakdown" in event else "BUY")
-        # 진입가
-        entry_px = self.price.from_signal(sym, sig)
-        qty = self._size_from_equity(entry_px)
-        ts = now_utc()
-        for exp_h in self.expiries:
-            self._open_position(sym, side, qty, entry_px, ts, exp_h, meta=sig)
-
-    # ---- loop ----
-    def step(self):
-        # 1) 새 시그널 → 포지션 오픈(만기별로 다중)
-        sigs = self.signal_feed.poll()
-        if sigs:
-            self.log.info(f"signals: {len(sigs)} (fan-out x{len(self.expiries)})")
-            for s in sigs:
-                try:
-                    self._map_signal_to_orders(s)
-                except Exception as e:
-                    self.log.error(f"signal->orders error: {e}")
-
-        # 2) 만기 도달 포지션 청산
-        if self.open_positions:
-            now = now_utc()
-            to_close = []
-            for pid, pos in list(self.open_positions.items()):
-                if now >= pos.expiry_ts:
-                    to_close.append(pid)
-            closes: List[CloseResult] = []
-            for pid in to_close:
-                pos = self.open_positions.pop(pid, None)
-                if not pos: 
-                    continue
-                exit_px = self.price.latest(pos.symbol)
-                cr = self._close_position(pos, exit_px, now)
-                closes.append(cr)
-            # 만기별 성과 누적
-            self._update_expiry_stats(closes)
-
-    def run(self, run_for_min=None):
-        self.log.info("=== Paper Engine START ===")
-        start = now_utc()
-        stop_at = None
-        if run_for_min:
-            stop_at = start + timedelta(minutes=run_for_min)
-            self.log.info(f"run-for: {run_for_min} min (stop_at={stop_at})")
-        try:
-            while True:
-                self.step()
-                time.sleep(self.interval_sec)
-                if stop_at and now_utc() >= stop_at:
-                    self.log.info("timebox reached; exiting")
-                    break
-        except KeyboardInterrupt:
-            self.log.info("KeyboardInterrupt - shutting down...")
-        self.log.info("engine closed")
-        self.log.info("=== Paper Engine END ===")
-
-# ========= CLI =========
-def main():
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--once", action="store_true", help="한 번만 step 실행")
-    p.add_argument("--run-for", type=int, help="분 단위로 실행 유지")
-    p.add_argument("--interval", type=int, default=10, help="폴링 주기(초)")
-    p.add_argument("--shadow", action="store_true", help="equity 갱신 없이 로직만")
-    p.add_argument("--price-mode", type=str, default="const", choices=["const","signals","feed"], help="가격 소스")
-    p.add_argument("--expiries", type=str, help='예: "0.5,1,2"')
-    args = p.parse_args()
-
-    expiries = parse_expiries_arg(args.expiries)
-    eng = PaperEngine(interval_sec=args.interval, shadow=args.shadow,
-                      price_mode=args.price_mode, expiries=expiries)
-    if args.once:
-        eng.step()
-    else:
-        eng.run(run_for_min=args.run_for)
-
-if __name__ == "__main__":
-    main()
+Write-Log "== DONE =="
+exit 0
