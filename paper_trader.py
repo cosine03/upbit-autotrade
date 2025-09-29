@@ -132,7 +132,8 @@ class PaperEngine:
                 expiry_sec=expiry_sec,
             )
             new_row = pd.DataFrame([asdict(row)])
-            open_df = pd.concat([open_df, new_row], ignore_index=True)
+            frames = [df for df in (open_df, new_row) if not df.empty]
+            open_df = pd.concat(frames, ignore_index=True) if frames else new_row
             created += 1
 
         if created:
