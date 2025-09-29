@@ -1,13 +1,9 @@
 <# 
 run_daily_report_and_email.ps1
-- AM/PM 일일 리포트(옵션 파이프라인) 생성 + HTML 메일 발송
-- 본문: Merged / Breakout / Box-Line 3개 섹션 각 Top10 표 (숫자 %는 소수점 2자리)
-- 카카오/모바일 미리보기 개선: 텍스트/HTML 멀티파트
+- AM/PM 리포트 생성(+옵션 파이프라인) 후 HTML 메일 발송
+- 본문: Merged / Breakout / Box-Line 각 Top10 (퍼센트 P2로 표기)
+- 카카오 알림 미리보기: text/plain + text/html 멀티파트
 - 로그: logs\reports\email_YYYY-MM-DD_{AM|PM}.log
-- 첨부:
-  1) bt_stats_summary_merged_{AM|PM}.csv
-  2) bt_breakout_only\bt_tv_events_stats_summary.csv
-  3) bt_boxin_linebreak\bt_tv_events_stats_summary.csv
 #>
 
 param(
@@ -36,20 +32,16 @@ function Write-Log([string]$msg) {
 }
 Write-Log "== RUN START == Root=$Root Half=$TagHalf =="
 
-# ---------- .env 로드 ----------
+# ---------- .env ----------
 $DotEnv = Join-Path $Root ".env"
 if (Test-Path -LiteralPath $DotEnv) {
   Get-Content $DotEnv | ForEach-Object {
     $line = $_.Trim()
-    if (-not $line) { return }
-    if ($line -match '^\s*#') { return }
+    if (-not $line -or $line -match '^\s*#') { return }
     if ($line.Contains('#')) { $line = $line.Split('#')[0].Trim(); if (-not $line) { return } }
-    $kv = $line.Split('=',2)
-    if ($kv.Count -ne 2) { return }
-    $k = $kv[0].Trim(); $v = $kv[1].Trim()
-    if (($v.StartsWith('"') -and $v.EndsWith('"')) -or ($v.StartsWith("'") -and $v.EndsWith("'"))) {
-      $v = $v.Substring(1, $v.Length-2)
-    }
+    $kv = $line.Split('=',2); if ($kv.Count -ne 2) { return }
+    $k=$kv[0].Trim(); $v=$kv[1].Trim()
+    if (($v.StartsWith('"') -and $v.EndsWith('"')) -or ($v.StartsWith("'") -and $v.EndsWith("'"))) { $v=$v.Substring(1,$v.Length-2) }
     if ($k) { Set-Item -Path ("Env:{0}" -f $k) -Value $v }
   }
   Write-Log ".env loaded."
@@ -57,34 +49,29 @@ if (Test-Path -LiteralPath $DotEnv) {
   Write-Log "[WARN] .env not found: $DotEnv"
 }
 
-# ---------- 주요 파일 ----------
-$SignalsTV       = Join-Path $Root "logs\signals_tv.csv"
+# ---------- 파일 ----------
 $BtDirBreakout   = Join-Path $DailyDir "bt_breakout_only"
 $BtDirBoxLine    = Join-Path $DailyDir "bt_boxin_linebreak"
 $BreakoutSummary = Join-Path $BtDirBreakout "bt_tv_events_stats_summary.csv"
 $BoxLineSummary  = Join-Path $BtDirBoxLine  "bt_tv_events_stats_summary.csv"
 $MergedSummary   = Join-Path $DailyDir ("bt_stats_summary_merged_{0}.csv" -f $TagHalf)
 
-# 존재 체크 로그 (PowerShell 방식)
 Write-Log ("[CHECK] exists merged={0} breakout={1} boxline={2}" -f `
-  ($(if (Test-Path $MergedSummary) {1} else {0}),
-   $(if (Test-Path $BreakoutSummary) {1} else {0}),
-   $(if (Test-Path $BoxLineSummary)  {1} else {0})))
+  ($(if (Test-Path $MergedSummary) {1}else{0}),
+   $(if (Test-Path $BreakoutSummary){1}else{0}),
+   $(if (Test-Path $BoxLineSummary) {1}else{0})))
 
-# ---------- 파이프라인 (선택) ----------
+# ---------- 파이프라인(옵션) ----------
 if ($RunPipeline) {
   try {
     Write-Log "[PIPE] start"
     if (-not (Test-Path $DailyDir)) { New-Item -ItemType Directory -Force -Path $DailyDir | Out-Null }
-    # (필요 시 기존 파이썬/PS 파이프라인 호출 지점)
-    # ...
-    # 요약 병합(두 요약이 있을 때만)
     if ((Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
-      $b = Import-Csv $BreakoutSummary
-      $l = Import-Csv $BoxLineSummary
+      $b=Import-Csv $BreakoutSummary
+      $l=Import-Csv $BoxLineSummary
       $b | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "breakout_only" -Force }
       $l | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "boxin_linebreak" -Force }
-      ($b + $l) | Export-Csv -NoTypeInformation -Encoding UTF8 $MergedSummary
+      ($b+$l) | Export-Csv -NoTypeInformation -Encoding UTF8 $MergedSummary
       Write-Log "merged summary saved -> $MergedSummary"
     } else {
       Write-Log "[PIPE][WARN] summary files missing; skip merge."
@@ -94,18 +81,15 @@ if ($RunPipeline) {
     Write-Log "[PIPE][ERROR] $($_.Exception.Message)"
   }
 } else {
-  # 병합 파일이 없으면 만들어 둠
   if ((-not (Test-Path $MergedSummary)) -and (Test-Path $BreakoutSummary) -and (Test-Path $BoxLineSummary)) {
     try {
-      $b = Import-Csv $BreakoutSummary
-      $l = Import-Csv $BoxLineSummary
+      $b=Import-Csv $BreakoutSummary
+      $l=Import-Csv $BoxLineSummary
       $b | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "breakout_only" -Force }
       $l | ForEach-Object { $_ | Add-Member -NotePropertyName strategy -NotePropertyValue "boxin_linebreak" -Force }
-      ($b + $l) | Export-Csv -NoTypeInformation -Encoding UTF8 $MergedSummary
+      ($b+$l) | Export-Csv -NoTypeInformation -Encoding UTF8 $MergedSummary
       Write-Log "merged summary saved -> $MergedSummary"
-    } catch {
-      Write-Log "[MERGE][ERROR] $($_.Exception.Message)"
-    }
+    } catch { Write-Log "[MERGE][ERROR] $($_.Exception.Message)" }
   }
 }
 
@@ -117,7 +101,7 @@ $SMTP_PASS = $env:SMTP_PASS
 $MAIL_FROM = if ($env:MAIL_FROM) { $env:MAIL_FROM } else { $SMTP_USER }
 $MAIL_TO   = $env:MAIL_TO
 
-# ---------- 표 HTML 생성 유틸 ----------
+# ---------- 표 HTML 유틸 ----------
 Add-Type -AssemblyName System.Web
 function New-TopHtml {
   param(
@@ -125,9 +109,10 @@ function New-TopHtml {
     [int]$Top = 10,
     [string]$Title = ""
   )
-  if (-not (Test-Path $CsvPath)) { return "<p style='color:#999;'>$Title: file not found</p>" }
+  if (-not (Test-Path -LiteralPath $CsvPath)) { return "<p style='color:#999;'>${Title}: file not found</p>" }
   $rows = Import-Csv $CsvPath | Select-Object event,expiry_h,trades,win_rate,avg_net,median_net,total_net,strategy
-  if (-not $rows) { return "<p style='color:#999;'>$Title: no rows</p>" }
+  if (-not $rows) { return "<p style='color:#999;'>${Title}: no rows</p>" }
+
   $rows = $rows | Select-Object `
     event,expiry_h,trades,
     @{n='win_rate';e={[double]$_.win_rate}},
@@ -142,13 +127,14 @@ function New-TopHtml {
   [void]$sb.AppendLine("<h3 style='margin:16px 0 8px'>$([System.Web.HttpUtility]::HtmlEncode($Title))</h3>")
   [void]$sb.AppendLine("<table style='border-collapse:collapse;width:860px'>")
   [void]$sb.AppendLine("<thead><tr>")
-  foreach ($c in $cols) { [void]$sb.AppendLine("<th style='padding:6px 8px;border:1px solid #ddd;background:#f7f7f7;text-align:left;'>$([System.Web.HttpUtility]::HtmlEncode($c))</th>") }
+  foreach ($c in $cols) {
+    [void]$sb.AppendLine("<th style='padding:6px 8px;border:1px solid #ddd;background:#f7f7f7;text-align:left;'>$([System.Web.HttpUtility]::HtmlEncode($c))</th>")
+  }
   [void]$sb.AppendLine("</tr></thead><tbody>")
   foreach ($r in $rows) {
     [void]$sb.AppendLine("<tr>")
     foreach ($c in $cols) {
       $v = $r.$c
-      # 백분율(2자리) 표기
       if ($c -in @('win_rate','avg_net','median_net','total_net')) {
         $v = ([double]$v).ToString("P2", [System.Globalization.CultureInfo]::InvariantCulture)
       }
@@ -160,14 +146,13 @@ function New-TopHtml {
   $sb.ToString()
 }
 
-# ---------- 본문(HTML/Plain) 작성 ----------
+# ---------- 본문 ----------
 $Subject = "[Autotrade] Daily Report $DATE $TagHalf"
 
 $MergedHtml   = New-TopHtml -CsvPath $MergedSummary   -Top 10 -Title "Merged Summary (Top 10)"
 $BreakoutHtml = New-TopHtml -CsvPath $BreakoutSummary -Top 10 -Title "Breakout Summary (Top 10)"
 $BoxLineHtml  = New-TopHtml -CsvPath $BoxLineSummary  -Top 10 -Title "Box-Line Summary (Top 10)"
 
-# 카카오/모바일 미리보기용 간단 텍스트
 $PreviewText = @"
 Autotrade Daily Report ($DATE $TagHalf)
 Attachments: 3
@@ -199,7 +184,7 @@ $BodyHtml = @"
   $MergedHtml
   $BreakoutHtml
   $BoxLineHtml
-  <p class="muted">Log: $(($EmailLog | Resolve-Path).Path)</p>
+  <p class="muted">Log: $([System.Web.HttpUtility]::HtmlEncode((Resolve-Path $EmailLog).Path))</p>
 </div>
 </body>
 </html>
@@ -215,26 +200,22 @@ foreach ($p in @($MergedSummary, $BreakoutSummary, $BoxLineSummary)) {
   if (Test-Path -LiteralPath $p) { $Attachments += (Resolve-Path $p).Path } else { Write-Log "[ATTACH][WARN] not found -> $p" }
 }
 
-# ---------- 메일 발송 (System.Net.Mail; UTF-8 강제) ----------
-$enc = [System.Text.Encoding]::UTF8
-$msg = New-Object System.Net.Mail.MailMessage
+# ---------- 메일 발송 ----------
+$enc  = [System.Text.Encoding]::UTF8
+$msg  = New-Object System.Net.Mail.MailMessage
 $msg.From = $MAIL_FROM
 foreach ($t in $ToList) { [void]$msg.To.Add($t) }
-$msg.Subject          = $Subject
-$msg.SubjectEncoding  = $enc
-$msg.IsBodyHtml       = $false  # 본문은 AlternateViews로 넣음
+$msg.Subject         = $Subject
+$msg.SubjectEncoding = $enc
+$msg.IsBodyHtml      = $false
 
-# Plain text (미리보기)
 $altText = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($PreviewText, $enc, "text/plain")
 $altText.TransferEncoding = [System.Net.Mime.TransferEncoding]::QuotedPrintable
-# HTML
 $altHtml = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($BodyHtml, $enc, "text/html")
 $altHtml.TransferEncoding = [System.Net.Mime.TransferEncoding]::QuotedPrintable
-
 $msg.AlternateViews.Add($altText)
 $msg.AlternateViews.Add($altHtml)
 
-# 첨부(파일명 인코딩)
 foreach ($p in $Attachments) {
   $att = New-Object System.Net.Mail.Attachment($p)
   if ($att.PSObject.Properties.Name -contains 'NameEncoding') { $att.NameEncoding = $enc }
@@ -242,7 +223,7 @@ foreach ($p in $Attachments) {
 }
 
 $smtp = New-Object System.Net.Mail.SmtpClient($SMTP_HOST, $SMTP_PORT)
-$smtp.EnableSsl  = $true
+$smtp.EnableSsl = $true
 if ($SMTP_USER -and $SMTP_PASS) { $smtp.Credentials = New-Object System.Net.NetworkCredential($SMTP_USER, $SMTP_PASS) }
 
 try {
