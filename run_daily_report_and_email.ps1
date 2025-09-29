@@ -82,12 +82,10 @@ $BreakoutSummary  = Join-Path $BtDirBreakout "bt_tv_events_stats_summary.csv"
 $BoxLineSummary   = Join-Path $BtDirBoxLine  "bt_tv_events_stats_summary.csv"
 $MergedSummary    = Join-Path $DailyDir ("bt_stats_summary_merged_{0}.csv" -f $TagHalf)
 
-Write-Log ("DailyDir={0}" -f $DailyDir)
-Write-Log ("[CHECK] exists merged={0} breakout={1} boxline={2}" -f
-  (Test-Path $MergedSummary ? 1 : 0),
-  (Test-Path $BreakoutSummary ? 1 : 0),
-  (Test-Path $BoxLineSummary ? 1 : 0)
-)
+Write-Log ("[CHECK] exists merged={0} breakout={1} boxline={2}" -f `
+    ($(if (Test-Path $MergedSummary) {1} else {0}), `
+     $(if (Test-Path $BreakoutSummary) {1} else {0}), `
+     $(if (Test-Path $BoxLineSummary) {1} else {0})))
 
 # ---------- Optional pipeline (merge only; 외부 호출은 필요시 추가) ----------
 if ($RunPipeline) {
