@@ -143,6 +143,31 @@ if (Test-Path $archivedSignals) {
   }
 }
 
+# ===== 6.5) 리포트 요약용 추가 (optional) =====
+
+# Dynamic Params 요약
+$dynJson = Join-Path $OUT "dynamic_params.json"
+if (Test-Path $dynJson) {
+  try {
+    $dyn = Get-Content $dynJson | ConvertFrom-Json
+    $suggested = $dyn.dist_max.value
+    $applied   = $distToUse
+    Write-Host ("[REPORT] dist_max suggested={0}, applied={1}" -f $suggested, $applied)
+
+    Add-Content -Path (Join-Path $OUT "report_extras.txt") `
+      -Value ("DYNAMIC DIST: suggested={0}, applied={1}" -f $suggested, $applied)
+  } catch {
+    Write-Warning "[REPORT] dynamic_params.json parse failed"
+  }
+}
+
+# Universe 변경 요약
+$univHist = ".\logs\history\universe_changes.csv"
+if (Test-Path $univHist) {
+  $lastLine = Get-Content $univHist | Select-Object -Last 1
+  Add-Content -Path (Join-Path $OUT "report_extras.txt") -Value ("UNIVERSE LAST CHANGE: {0}" -f $lastLine)
+}
+
 # ===== 6) 리포트/히스토리 업데이트 =====
 $sum1 = "$OUT\bt_breakout_only\bt_tv_events_stats_summary.csv"
 $sum2 = "$OUT\bt_boxin_linebreak\bt_tv_events_stats_summary.csv"
