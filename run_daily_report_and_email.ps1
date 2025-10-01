@@ -1,16 +1,30 @@
-@'
+<# ===============================
+ run_daily_report_and_email.ps1 (v4, PS5 호환)
+ - .env에서 SMTP 자동 로딩(-UseEnv)
+ - 레거시 trades_closed.csv 행 교정(A/B 패턴)
+ - 집계 윈도우/리젝트 요약/HTML 메일/CSV 첨부
+ - 표준 헤더:
+   opened_at,symbol,event,side,level,closed_at,entry_price,exit_price,pnl,reason,fee
+================================ #>
+
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($true)
+$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+
 param(
+  # 집계/옵션
   [int]$SinceHours = 24,
   [string]$TagHalf = 'AM',
   [switch]$RunPipeline,
   [switch]$AttachCsv,
   [switch]$UseEnv,
 
+  # 경로
   [string]$SignalsCsv      = ".\logs\signals_tv.csv",
   [string]$RejectsCsv      = ".\logs\paper\rejects.csv",
   [string]$TradesOpenCsv   = ".\logs\paper\trades_open.csv",
   [string]$TradesClosedCsv = ".\logs\paper\trades_closed.csv",
 
+  # 메일
   [string]$SmtpServer,
   [int]$SmtpPort = 587,
   [string]$From,
@@ -19,101 +33,104 @@ param(
   [Security.SecureString]$SmtpPass,
   [bool]$UseStartTls = $true,
 
+  # 제목 접두어
   [string]$SubjectPrefix = "[PaperTrader] Daily Report"
 )
 
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($true)
-
 function New-NowUtc { [DateTimeOffset]::UtcNow }
 
-function Load-DotEnv([string]$Path) {
+function Load-DotEnv([string]$Path){
   if (-not (Test-Path $Path)) { Write-Warning "[WARN] .env not found: $Path"; return }
   $raw = Get-Content -Path $Path -Raw -Encoding UTF8
-  if ($raw.Length -gt 0 -and $raw[0] -eq [char]0xFEFF) { $raw = $raw.Substring(1) }
-  foreach ($line0 in ($raw -split "`n")) {
-    $line = $line0.Trim()
-    if (-not $line -or $line.StartsWith('#')) { continue }
+  if ($raw.StartsWith([char]0xFEFF)) { $raw = $raw.Substring(1) } # BOM 제거
+  $raw -split "`n" | ForEach-Object {
+    $line = $_.Trim()
+    if (-not $line -or $line.StartsWith('#')) { return }
     $eq = $line.IndexOf('=')
-    if ($eq -lt 1) { continue }
+    if ($eq -lt 1) { return }
     $k = $line.Substring(0,$eq).Trim()
     $v = $line.Substring($eq+1).Trim()
     if ($v.StartsWith('"') -and $v.EndsWith('"')) { $v = $v.Substring(1,$v.Length-2) }
     if ($v.StartsWith("'") -and $v.EndsWith("'")) { $v = $v.Substring(1,$v.Length-2) }
     Set-Item -Path ("Env:{0}" -f $k) -Value $v
   }
-  Write-Host "[INFO] .env loaded (SMTP_* keys)" -ForegroundColor Cyan
+  Write-Host "[INFO] .env loaded (SMTP_*):" -ForegroundColor Cyan
   Get-ChildItem Env:SMTP_* | Format-Table Name,Value -Auto
 }
 
-function Parse-Double($s) {
+function Parse-Double($s){
   if ($null -eq $s -or "$s".Trim() -eq "") { return $null }
   $out = $null
   if ([double]::TryParse("$s",[ref]$out)) { return $out } else { return $null }
 }
 
-function ToDate($s) {
+function ToDate($s){
   if ($null -eq $s -or "$s".Trim() -eq "") { return $null }
   try { return [datetimeoffset]::Parse("$s") } catch { return $null }
 }
 
-function Fmt6($n) {
+function Fmt6($n){
   if ($null -eq $n) { return "-" }
-  "{0:N6}" -f [double]$n
+  return ("{0:N6}" -f [double]$n)
 }
 
-function Read-CsvSafe([string]$Path) {
+function Read-CsvSafe([string]$Path){
   if (-not (Test-Path $Path)) { return @() }
   try { return Import-Csv $Path } catch { return @() }
 }
 
-function New-HtmlTable([array]$Rows,[string]$Title,[string[]]$Columns) {
+function New-HtmlTable([array]$Rows,[string]$Title,[string[]]$Columns){
   $sb = New-Object System.Text.StringBuilder
   $null = $sb.AppendLine("<h3>$Title</h3>")
   if (-not $Rows -or $Rows.Count -eq 0) {
-    $null = $sb.AppendLine("<p style='color:#666'>no rows</p>")
+    $null = $sb.AppendLine('<p class="small">no rows</p>')
     return $sb.ToString()
   }
-  $null = $sb.AppendLine("<table style='border-collapse:collapse'>")
+  $null = $sb.AppendLine("<table>")
   $null = $sb.AppendLine("<thead><tr>")
-  foreach($c in $Columns){ $null = $sb.AppendLine("<th style='border:1px solid #ccc;padding:4px 6px'>$c</th>") }
+  foreach($c in $Columns){ $null = $sb.AppendLine("<th>$c</th>") }
   $null = $sb.AppendLine("</tr></thead><tbody>")
   foreach($r in $Rows){
     $null = $sb.AppendLine("<tr>")
     foreach($c in $Columns){
       $val = $r.$c
       if ($val -is [datetimeoffset]) { $val = $val.ToString("u") }
-      elseif ($c -in @('entry_price','exit_price','pnl','fee')) { $val = if ($null -ne $val) { Fmt6 $val } else { "" } }
-      $null = $sb.AppendLine("<td style='border:1px solid #ccc;padding:4px 6px'>$val</td>")
+      elseif ($c -in @('entry_price','exit_price','pnl','fee')) {
+        $val = if ($null -ne $val) { Fmt6 $val } else { "" }
+      }
+      $null = $sb.AppendLine("<td>$val</td>")
     }
     $null = $sb.AppendLine("</tr>")
   }
   $null = $sb.AppendLine("</tbody></table>")
-  $sb.ToString()
+  return $sb.ToString()
 }
 
-# ---- ENV 보강 ----
+# ---------- .env → 파라미터 보강 ----------
 if ($UseEnv) {
   $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
   Load-DotEnv -Path (Join-Path $root ".env")
   if (-not $SmtpServer -and $env:SMTP_SERVER) { $SmtpServer = $env:SMTP_SERVER }
   if (-not $SmtpServer -and $env:SMTP_HOST)   { $SmtpServer = $env:SMTP_HOST }
-  if (-not $PSBoundParameters.ContainsKey('SmtpPort') -and $env:SMTP_PORT) { [int]$SmtpPort = $env:SMTP_PORT }
-  if (-not $From -and $env:SMTP_FROM) { $From = $env:SMTP_FROM }
-  if (-not $To   -and $env:SMTP_TO)   { $To   = $env:SMTP_TO }
-  if (-not $SmtpUser -and $env:SMTP_USER) { $SmtpUser = $env:SMTP_USER }
-  if (-not $SmtpPass -and $env:SMTP_PASS) { $SmtpPass = ConvertTo-SecureString $env:SMTP_PASS -AsPlainText -Force }
+  if (-not $SmtpPort   -and $env:SMTP_PORT)   { [int]$SmtpPort = $env:SMTP_PORT }
+  if (-not $From       -and $env:SMTP_FROM)   { $From   = $env:SMTP_FROM }
+  if (-not $To         -and $env:SMTP_TO)     { $To     = $env:SMTP_TO }
+  if (-not $SmtpUser   -and $env:SMTP_USER)   { $SmtpUser = $env:SMTP_USER }
+  if (-not $SmtpPass   -and $env:SMTP_PASS)   { $SmtpPass = ConvertTo-SecureString $env:SMTP_PASS -AsPlainText -Force }
   if ($env:SMTP_TLS) { $UseStartTls = [bool]::Parse($env:SMTP_TLS) }
 }
 
-# 평문 비번 보정
-if ($SmtpPass -is [string] -and $SmtpPass) { $SmtpPass = ConvertTo-SecureString $SmtpPass -AsPlainText -Force }
-
-# 필수값
-if (-not $From -or -not $To -or -not $SmtpServer -or -not $SmtpUser -or -not $SmtpPass) {
-  throw "SMTP From/To/Server/User/Pass is required (via .env or parameters)."
+# 수동 실행에서 평문 비번이 들어온 경우 보정
+if ($SmtpPass -is [string] -and $SmtpPass) {
+  $SmtpPass = ConvertTo-SecureString $SmtpPass -AsPlainText -Force
 }
 
-# (선택) 사전 파이프라인
+# 필수값 체크
+if (-not $From -or -not $To -or -not $SmtpServer -or -not $SmtpUser -or -not $SmtpPass) {
+  throw "SMTP From/To/Server/User/Pass 중 누락이 있습니다. (.env 또는 파라미터로 채워주세요)"
+}
+
+# ---------- (선택) 사전 파이프라인 실행 ----------
 if ($RunPipeline) {
   try {
     $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -122,36 +139,39 @@ if ($RunPipeline) {
       if ($TagHalf) { & $pipe -TagHalf $TagHalf } else { & $pipe }
       Write-Host "[OK] Pre-pipeline executed." -ForegroundColor Green
     } else {
-      Write-Warning "[WARN] run_pipeline.ps1 not found - skipped"
+      Write-Warning "[WARN] run_pipeline.ps1 없음 - 건너뜀"
     }
   } catch {
-    Write-Warning "[WARN] Pre-pipeline failed: $($_.Exception.Message)"
+    Write-Warning "[WARN] 사전 파이프라인 실행 실패: $($_.Exception.Message)"
   }
 }
 
-# 데이터 로드
+# ---------- 데이터 로드 & 윈도우 ----------
 $cut = (New-NowUtc).AddHours(-$SinceHours)
 $trades  = Read-CsvSafe $TradesClosedCsv
 $rejects = Read-CsvSafe $RejectsCsv
 
-# trades_closed 정규화(레거시 A/B 교정)
+# ---------- trades_closed 정규화(+레거시 교정) ----------
 $closedRows = @()
 foreach($row in $trades){
   $opened_at = ToDate $row.opened_at
   $closed_at = ToDate $row.closed_at
-  $entry0 = Parse-Double $row.entry_price
-  $exit0  = Parse-Double $row.exit_price
-  $pnl0   = Parse-Double $row.pnl
-  $fee0   = Parse-Double $row.fee
+
+  $entry0  = Parse-Double $row.entry_price
+  $exit0   = Parse-Double $row.exit_price
+  $pnl0    = Parse-Double $row.pnl
+  $fee0    = Parse-Double $row.fee
   $reason0 = $row.reason
 
-  $isPlainNum = ($row.entry_price -match '^\s*[\+\-]?\d+(\.\d+)?\s*$')
-  if (($null -eq $entry0) -and ($null -ne (Parse-Double $row.exit_price)) -and -not $isPlainNum -and ($row.pnl -eq $null -or "$($row.pnl)".Trim() -eq "")) {
+  # 패턴 A: entry=reason(문자), exit=fee(숫자), pnl 비어있음
+  $isPlainNumber = ($row.entry_price -match '^\s*[\+\-]?\d+(\.\d+)?\s*$')
+  if (($null -eq $entry0) -and ($null -ne (Parse-Double $row.exit_price)) -and -not $isPlainNumber -and ($row.pnl -eq $null -or "$($row.pnl)".Trim() -eq "")) {
     $reason0 = $row.entry_price
     $fee0    = Parse-Double $row.exit_price
     $entry0  = $null; $exit0 = $null; $pnl0 = $null
   }
 
+  # 패턴 B: reason 자리에 pnl(숫자), 나머지 한 칸씩 밀린 케이스
   $reasonAsNum = Parse-Double $row.reason
   if (($null -eq $entry0) -and ($null -ne $exit0) -and ($null -ne $pnl0) -and ($null -ne $reasonAsNum) -and ($null -ne $fee0)) {
     $entry0  = $exit0
@@ -176,7 +196,7 @@ foreach($row in $trades){
 }
 $closedRows = $closedRows | Where-Object { $_.closed_at -and $_.closed_at -ge $cut } | Sort-Object closed_at
 
-# 요약
+# ---------- 요약 ----------
 $cnt = $closedRows.Count
 $pnlVals = $closedRows | ForEach-Object { $_.pnl } | Where-Object { $_ -ne $null }
 $totalPnl = if ($pnlVals){ ($pnlVals | Measure-Object -Sum).Sum } else { 0 }
@@ -187,40 +207,49 @@ $winCnt = $winRows.Count; $lossCnt = $lossRows.Count; $flatCnt = $flatRows.Count
 $avgWin = if ($winRows){ ($winRows | Measure-Object -Property pnl -Average).Average } else { $null }
 $avgLoss = if ($lossRows){ ($lossRows | Measure-Object -Property pnl -Average).Average } else { $null }
 
-# 리젝트 요약
-$rejRows = $rejects | ForEach-Object {
-  [pscustomobject]@{
-    now    = (ToDate $_.now)
-    ts     = (ToDate $_.ts)
-    symbol = $_.symbol
-    event  = $_.event
-    reason = $_.reason
-    phase  = $_.phase
-  }
-} | Where-Object { $_.now -and $_.now -ge $cut }
+# ---------- 리젝트 요약 ----------
+$rejRows =
+  $rejects |
+  ForEach-Object {
+    [pscustomobject]@{
+      now    = (ToDate $_.now)
+      ts     = (ToDate $_.ts)
+      symbol = $_.symbol
+      event  = $_.event
+      reason = $_.reason
+      phase  = $_.phase
+    }
+  } |
+  Where-Object { $_.now -and $_.now -ge $cut }
 
-$rejSummary = $rejRows | Group-Object reason | Sort-Object Count -Desc |
+$rejSummary =
+  $rejRows |
+  Group-Object reason |
+  Sort-Object Count -Desc |
   ForEach-Object { [pscustomobject]@{ reason = $_.Name; count = $_.Count } }
 
-# HTML
-$sinceStr = $cut.ToString("u")
-$nowStr   = (New-NowUtc).ToString("u")
-$tag = if ($TagHalf) { " $TagHalf" } else { "" }
-$subject = "$SubjectPrefix$tag - last ${SinceHours}h (UTC)"
-
+# ---------- HTML ----------
 $style = @"
 <style>
 body{font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:14px}
 h2{margin:0 0 8px 0}
 h3{margin:12px 0 6px 0}
+table{border-collapse:collapse}
+th,td{border:1px solid #ccc;padding:4px 6px}
 .small{color:#666}
 </style>
 "@
 
+$sinceStr = $cut.ToString("u")
+$nowStr   = (New-NowUtc).ToString("u")
+$tag = if ($TagHalf) { " $TagHalf" } else { "" }
+$subject = "$SubjectPrefix$tag — last ${SinceHours}h (UTC)"
+
 $summaryHtml = @"
 $style
 <h2>PaperTrader Daily Report</h2>
-<p class=""small"">Window: <strong>$sinceStr</strong> -> <strong>$nowStr</strong> (UTC)</p>
+<p class="small">Window: <strong>$sinceStr</strong> → <strong>$nowStr</strong> (UTC)</p>
+
 <h3>PNL Summary</h3>
 <ul>
   <li>Total closed trades: <strong>$cnt</strong></li>
@@ -236,7 +265,7 @@ $closedTable = New-HtmlTable -Rows $closedRows -Title "Closed Trades (last ${Sin
 $rejTable = New-HtmlTable -Rows $rejSummary -Title "Rejects by Reason (last ${SinceHours}h)" -Columns @('reason','count')
 $htmlBody = $summaryHtml + $closedTable + $rejTable
 
-# 메일
+# ---------- 메일 발송 ----------
 if (-not $SmtpUser) { $SmtpUser = $From }
 if (-not $SmtpPass) { $SmtpPass = Read-Host -AsSecureString -Prompt "SMTP app password for $SmtpUser" }
 $cred = New-Object System.Management.Automation.PSCredential($SmtpUser, $SmtpPass)
@@ -253,4 +282,3 @@ Send-MailMessage `
   -ErrorAction Stop
 
 Write-Host "[OK] Mail sent to $To ($subject)" -ForegroundColor Green
-'@ | Set-Content -Path .\run_daily_report_and_email.ps1 -Encoding UTF8 -NoNewline
