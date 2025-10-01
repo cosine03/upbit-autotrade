@@ -1,58 +1,29 @@
-param(
-  [string]$CsvPath = ".\logs\paper\trades_closed.csv"
-)
+# trades_closed.csv 헤더를 표준 헤더로 교체하는 스크립트
+# 기존 데이터는 유지하면서 헤더만 교체
 
-$STD = "opened_at,symbol,event,side,level,closed_at,entry_price,exit_price,pnl,reason,fee"
+$path = ".\logs\paper\trades_closed.csv"
 
-if (-not (Test-Path $CsvPath)) { Write-Host "[INFO] not found: $CsvPath"; exit 0 }
+if (Test-Path $path) {
+    $rows = Get-Content $path
+    if ($rows.Count -gt 0) {
+        # 올바른 헤더 정의 (paper_trader.py 기준)
+        $correct = "opened_at,symbol,event,side,level,closed_at,entry_price,exit_price,pnl,reason,fee"
 
-$bak = "$CsvPath.bak_$(Get-Date -Format 'yyyyMMddHHmmss')"
-Copy-Item $CsvPath $bak -Force
-Write-Host "[BACKUP] -> $bak"
-
-$lines = Get-Content $CsvPath
-if ($lines.Count -eq 0) {
-  Set-Content $CsvPath $STD
-  Write-Host "[FIX] wrote header only."
-  exit 0
-}
-
-if ($lines[0] -ne $STD) {
-  # 헤더 교체 + 휴리스틱 재매핑
-  $data = @()
-  for ($i=0; $i -lt $lines.Count; $i++) {
-    if ($i -eq 0 -and $lines[$i] -match "^opened_at,") { continue } # 과거 다른 헤더 버리기
-    elseif ($i -eq 0 -and $lines[$i] -match "^\d{4}-\d{2}-\d{2}T") {
-      # 첫 줄부터 데이터 → 그대로 둠
-      $data += $lines[$i]
-    }
-    elseif ($i -gt 0) {
-      $data += $lines[$i]
-    }
-  }
-
-  # 간단한 맵핑: 11컬럼이 아니고, 뒤쪽이 reason,fee 같은 모양이면 rearrange 시도
-  $fixed = @()
-  foreach ($row in $data) {
-    if ([string]::IsNullOrWhiteSpace($row)) { continue }
-    $cells = $row.Split(',')
-    if ($cells.Count -eq 11) {
-      $fixed += $row
+        # 첫 줄이 올바르지 않으면 교체
+        if ($rows[0] -ne $correct) {
+            Write-Host "기존 헤더 수정 중..."
+            $rows[0] = $correct
+            $rows | Set-Content -Path $path -Encoding UTF8
+            Write-Host "헤더 교체 완료 ✅"
+        }
+        else {
+            Write-Host "이미 올바른 헤더입니다 ✅"
+        }
     }
     else {
-      # 흔한 패턴: opened_at, symbol, event, side, level, closed_at, reason, entry, exit, pnl, fee (과거 오류)
-      if ($cells.Count -ge 11 -and $cells[6] -notmatch "^\d+(\.\d+)?$") {
-        $reordered = @($cells[0..5] + @($cells[7],$cells[8],$cells[9]) + @($cells[6],$cells[10]))
-        $fixed += ($reordered -join ',')
-      } else {
-        $fixed += $row
-      }
+        Write-Host "파일이 비어 있습니다."
     }
-  }
-
-  Set-Content $CsvPath $STD
-  Add-Content $CsvPath ($fixed -join "`n")
-  Write-Host "[FIX] header normalized."
-} else {
-  Write-Host "[OK] already normalized."
+}
+else {
+    Write-Host "파일이 존재하지 않습니다: $path"
 }
