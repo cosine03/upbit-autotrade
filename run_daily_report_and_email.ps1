@@ -3,13 +3,14 @@
  - .env 로드(-UseEnv)
  - run_pipeline.ps1 사전 실행(-RunPipeline)
  - trades_closed 레거시 행 교정(A/B)
- - HTML 메일 + CSV 첨부 (+ CSV 파일 첨부옵션)
+ - HTML 메일 + CSV 첨부
+ - 다중 수신자 콤마 분리
  표준 헤더:
  opened_at,symbol,event,side,level,closed_at,entry_price,exit_price,pnl,reason,fee
 ================================ #>
 
 param(
-  # 집계 범위 & 파이프라인
+  # 보고/옵션
   [int]    $SinceHours       = 24,
   [string] $TagHalf          = 'AM',
   [switch] $RunPipeline,
@@ -22,20 +23,20 @@ param(
   [string] $TradesOpenCsv    = ".\logs\paper\trades_open.csv",
   [string] $TradesClosedCsv  = ".\logs\paper\trades_closed.csv",
 
-  # SMTP
+  # 메일
   [string] $SmtpServer,
   [int]    $SmtpPort         = 587,
   [string] $From,
-  [string] $To,                    # 쉼표로 여러 명 가능
+  [string] $To,                 # 콤마로 다중 수신자 가능
   [string] $SmtpUser,
-  [Security.SecureString] $SmtpPass,
+  [System.Security.SecureString] $SmtpPass,
   [bool]   $UseStartTls      = $true,
 
   # 제목 접두어
   [string] $SubjectPrefix    = "[PaperTrader] Daily Report"
 )
 
-# 콘솔/파일 UTF-8
+# --- 콘솔/파일 UTF-8 ---
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($true)
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 
@@ -57,7 +58,7 @@ function Load-DotEnv([string]$Path){
     if ($v.StartsWith("'") -and $v.EndsWith("'")) { $v = $v.Substring(1,$v.Length-2) }
     Set-Item -Path ("Env:{0}" -f $k) -Value $v
   }
-  Write-Host "[INFO] .env loaded (keys preview):" -ForegroundColor Cyan
+  Write-Host "[INFO] .env loaded (SMTP_*):" -ForegroundColor Cyan
   Get-ChildItem Env:SMTP_* | Format-Table Name,Value -Auto
 }
 
@@ -117,15 +118,14 @@ function New-HtmlTable([array]$Rows,[string]$Title,[string[]]$Columns){
 if ($UseEnv) {
   $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
   Load-DotEnv -Path (Join-Path $root ".env")
-
-  # 키 이름 호환 (SMTP_* 우선, MAIL_* 백워드)
-  if (-not $SmtpServer) { $SmtpServer = $env:SMTP_SERVER; if (-not $SmtpServer) { $SmtpServer = $env:SMTP_HOST } }
-  if (-not $From)       { $From       = $env:SMTP_FROM;   if (-not $From)       { $From = $env:MAIL_FROM } }
-  if (-not $To)         { $To         = $env:SMTP_TO;     if (-not $To)         { $To   = $env:MAIL_TO } }
-  if (-not $SmtpUser)   { $SmtpUser   = $env:SMTP_USER }
-  if (-not $SmtpPass -and $env:SMTP_PASS) { $SmtpPass = ConvertTo-SecureString $env:SMTP_PASS -AsPlainText -Force }
-  if ($env:SMTP_PORT)   { try { $SmtpPort = [int]$env:SMTP_PORT } catch {} }
-  if ($env:SMTP_TLS)    { try { $UseStartTls = [bool]::Parse($env:SMTP_TLS) } catch {} }
+  if (-not $SmtpServer -and $env:SMTP_SERVER) { $SmtpServer = $env:SMTP_SERVER }
+  if (-not $SmtpServer -and $env:SMTP_HOST)   { $SmtpServer = $env:SMTP_HOST }
+  if (-not $From       -and $env:SMTP_FROM)   { $From       = $env:SMTP_FROM }
+  if (-not $To         -and $env:SMTP_TO)     { $To         = $env:SMTP_TO }
+  if (-not $SmtpUser   -and $env:SMTP_USER)   { $SmtpUser   = $env:SMTP_USER }
+  if (-not $SmtpPass   -and $env:SMTP_PASS)   { $SmtpPass   = ConvertTo-SecureString $env:SMTP_PASS -AsPlainText -Force }
+  if ($env:SMTP_PORT) { try { $SmtpPort = [int]$env:SMTP_PORT } catch {} }
+  if ($env:SMTP_TLS)  { try { $UseStartTls = [bool]::Parse($env:SMTP_TLS) } catch {} }
 }
 
 # 평문 pw로 넘어오면 SecureString 변환
@@ -172,14 +172,14 @@ foreach($row in $trades){
   $reason0 = $row.reason
 
   # 패턴 A: entry=quick_expired(문자), exit=0.001(수치), pnl 비어있음
-  $isEntryNumber = ($row.entry_price -match '^\s*[\+\-]?\d+(\.\d+)?\s*$')
+  $isEntryNumber = $row.entry_price -match '^\s*[\+\-]?\d+(\.\d+)?\s*$'
   if (($null -eq $entry0) -and ($null -ne (Parse-Double $row.exit_price)) -and -not $isEntryNumber -and ($null -eq $pnl0)) {
     $reason0 = $row.entry_price
     $fee0    = Parse-Double $row.exit_price
     $entry0  = $null; $exit0 = $null; $pnl0 = $null
   }
 
-  # 패턴 B: reason 자리에 pnl(숫자) 밀림
+  # 패턴 B: reason 자리에 pnl(숫자) 밀려온 케이스
   $reasonAsNum = Parse-Double $row.reason
   if (($null -eq $entry0) -and ($null -ne $exit0) -and ($null -ne $pnl0) -and ($null -ne $reasonAsNum) -and ($null -ne $fee0)) {
     $entry0  = $exit0
@@ -273,11 +273,10 @@ $rejTable    = New-HtmlTable -Rows $rejSummary -Title "Rejects by Reason (last $
 $htmlBody    = $summaryHtml + $closedTable + $rejTable
 
 # ---------- 메일 ----------
+$toList = $To -split '\s*,\s*' | Where-Object { $_ -and $_.Trim() -ne "" }
 if (-not $SmtpUser) { $SmtpUser = $From }
 if (-not $SmtpPass) { $SmtpPass = Read-Host -AsSecureString -Prompt "SMTP app password for $SmtpUser" }
 $cred = New-Object System.Management.Automation.PSCredential($SmtpUser, $SmtpPass)
-
-$toList = if ($To) { $To -split '\s*,\s*' } else { @() }
 
 $attachments = @()
 if ($AttachCsv -and (Test-Path $TradesClosedCsv)) { $attachments += (Resolve-Path $TradesClosedCsv).Path }
