@@ -8,29 +8,21 @@
  opened_at,symbol,event,side,level,closed_at,entry_price,exit_price,pnl,reason,fee
 ================================ #>
 
-<# ===============================
- run_daily_report_and_email.ps1 (PS5-stable)
- - .env 로드(-UseEnv)
- - run_pipeline.ps1 사전 실행(-RunPipeline)
- - trades_closed 레거시 행 교정(A/B)
- - HTML 메일 + CSV 첨부
- 표준 헤더:
- opened_at,symbol,event,side,level,closed_at,entry_price,exit_price,pnl,reason,fee
-================================ #>
-
-# 반드시 스크립트의 첫 번째 구문이어야 함
 param(
+  # 보고서/파이프라인
   [int]    $SinceHours       = 24,
   [string] $TagHalf          = 'AM',
   [switch] $RunPipeline,
   [switch] $AttachCsv,
   [switch] $UseEnv,
 
+  # 경로
   [string] $SignalsCsv       = ".\logs\signals_tv.csv",
   [string] $RejectsCsv       = ".\logs\paper\rejects.csv",
   [string] $TradesOpenCsv    = ".\logs\paper\trades_open.csv",
   [string] $TradesClosedCsv  = ".\logs\paper\trades_closed.csv",
 
+  # SMTP
   [string] $SmtpServer,
   [int]    $SmtpPort         = 587,
   [string] $From,
@@ -39,12 +31,14 @@ param(
   [Security.SecureString] $SmtpPass,
   [bool]   $UseStartTls      = $true,
 
+  # 제목 접두어
   [string] $SubjectPrefix    = "[PaperTrader] Daily Report"
 )
 
-# ← 여기부터는 다른 구문 가능
+# ----- 공통 설정 -----
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($true)
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+$ErrorActionPreference = 'Stop'
 
 # ---------- 유틸 ----------
 function New-NowUtc { [DateTimeOffset]::UtcNow }
@@ -64,8 +58,13 @@ function Load-DotEnv([string]$Path){
     if ($v.StartsWith("'") -and $v.EndsWith("'")) { $v = $v.Substring(1,$v.Length-2) }
     Set-Item -Path ("Env:{0}" -f $k) -Value $v
   }
-  Write-Host "[INFO] .env loaded (SMTP_* / MAIL_*):" -ForegroundColor Cyan
-  Get-ChildItem Env:SMTP_* , Env:MAIL_* | Sort-Object Name | Format-Table Name,Value -Auto
+  # 구버전 키 보강
+  if ($env:MAIL_FROM -and -not $env:SMTP_FROM) { $env:SMTP_FROM = $env:MAIL_FROM }
+  if ($env:MAIL_TO   -and -not $env:SMTP_TO)   { $env:SMTP_TO   = $env:MAIL_TO   }
+  if ($env:SMTP_HOST -and -not $env:SMTP_SERVER) { $env:SMTP_SERVER = $env:SMTP_HOST }
+
+  Write-Host "[INFO] .env loaded (SMTP_*):" -ForegroundColor Cyan
+  Get-ChildItem Env:SMTP_* | Format-Table Name,Value -Auto
 }
 
 function Parse-Double($s){
@@ -106,36 +105,39 @@ function New-HtmlTable([array]$Rows,[string]$Title,[string[]]$Columns){
     foreach($c in $Columns){
       $val = $r.$c
       if ($val -is [datetimeoffset]) { $val = $val.ToString("u") }
-      elseif ($c -in @('entry_price','exit_price','pnl','fee')) { $val = if ($null -ne $val) { Fmt6 $val } else { "" } }
+      elseif ($c -in @('entry_price','exit_price','pnl','fee')) {
+        $val = if ($null -ne $val) { Fmt6 $val } else { "" }
+      }
       $null = $sb.AppendLine("<td>$val</td>")
     }
     $null = $sb.AppendLine("</tr>")
   }
   $null = $sb.AppendLine("</tbody></table>")
-  return $sb.ToString()
+  $sb.ToString()
 }
 
 # ---------- .env -> 파라미터 보강 ----------
 if ($UseEnv) {
   $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
   Load-DotEnv -Path (Join-Path $root ".env")
-
-  # 우선순위: SMTP_* -> MAIL_*(별칭)
-  if (-not $SmtpServer) { if ($env:SMTP_SERVER) { $SmtpServer = $env:SMTP_SERVER } elseif ($env:SMTP_HOST) { $SmtpServer = $env:SMTP_HOST } }
-  if (-not $From)       { if ($env:SMTP_FROM)   { $From   = $env:SMTP_FROM }   elseif ($env:MAIL_FROM) { $From = $env:MAIL_FROM } }
-  if (-not $To)         { if ($env:SMTP_TO)     { $To     = $env:SMTP_TO }     elseif ($env:MAIL_TO)   { $To   = $env:MAIL_TO } }
-  if (-not $SmtpUser)   { if ($env:SMTP_USER)   { $SmtpUser = $env:SMTP_USER } }
-  if (-not $SmtpPass)   { if ($env:SMTP_PASS)   { $SmtpPass = ConvertTo-SecureString $env:SMTP_PASS -AsPlainText -Force } }
+  if (-not $SmtpServer -and $env:SMTP_SERVER) { $SmtpServer = $env:SMTP_SERVER }
+  if (-not $SmtpServer -and $env:SMTP_HOST)   { $SmtpServer = $env:SMTP_HOST }
+  if (-not $From       -and $env:SMTP_FROM)   { $From       = $env:SMTP_FROM }
+  if (-not $To         -and $env:SMTP_TO)     { $To         = $env:SMTP_TO }
+  if (-not $SmtpUser   -and $env:SMTP_USER)   { $SmtpUser   = $env:SMTP_USER }
+  if (-not $SmtpPass   -and $env:SMTP_PASS)   { $SmtpPass   = ConvertTo-SecureString $env:SMTP_PASS -AsPlainText -Force }
   if ($env:SMTP_PORT) { try { $SmtpPort = [int]$env:SMTP_PORT } catch {} }
   if ($env:SMTP_TLS)  { try { $UseStartTls = [bool]::Parse($env:SMTP_TLS) } catch {} }
 }
 
 # 평문 pw로 넘어오면 SecureString 변환
-if ($SmtpPass -is [string] -and $SmtpPass) { $SmtpPass = ConvertTo-SecureString $SmtpPass -AsPlainText -Force }
+if ($SmtpPass -is [string] -and $SmtpPass) {
+  $SmtpPass = ConvertTo-SecureString $SmtpPass -AsPlainText -Force
+}
 
 # 필수 체크
 if (-not $From -or -not $To -or -not $SmtpServer -or -not $SmtpUser -or -not $SmtpPass) {
-  throw "Missing SMTP From/To/Server/User/Pass (use .env or pass as parameters)."
+  throw "SMTP From/To/Server/User/Pass 중 누락이 있습니다. (.env 또는 파라미터로 채워주세요)"
 }
 
 # ---------- (옵션) 사전 파이프라인 ----------
@@ -149,7 +151,9 @@ if ($RunPipeline) {
     } else {
       Write-Warning "[WARN] run_pipeline.ps1 없음 - 건너뜀"
     }
-  } catch { Write-Warning "[WARN] Pre-pipeline failed: $($_.Exception.Message)" }
+  } catch {
+    Write-Warning "[WARN] 사전 파이프라인 실패: $($_.Exception.Message)"
+  }
 }
 
 # ---------- 데이터 로드 ----------
@@ -271,12 +275,13 @@ $rejTable    = New-HtmlTable -Rows $rejSummary -Title "Rejects by Reason (last $
 $htmlBody    = $summaryHtml + $closedTable + $rejTable
 
 # ---------- 메일 ----------
+# 수신자 분리(쉼표/세미콜론)
+$toList = @()
+if ($To) { $toList = ($To -split '[,;]\s*' | Where-Object { $_ -ne '' }) }
+
 if (-not $SmtpUser) { $SmtpUser = $From }
 if (-not $SmtpPass) { $SmtpPass = Read-Host -AsSecureString -Prompt "SMTP app password for $SmtpUser" }
 $cred = New-Object System.Management.Automation.PSCredential($SmtpUser, $SmtpPass)
-
-# To가 "a@x,b@y" 형태면 반드시 배열로 쪼갬(헤더 콤마 오류 방지)
-$toList = $To -split '\s*,\s*'
 
 $attachments = @()
 if ($AttachCsv -and (Test-Path $TradesClosedCsv)) { $attachments += (Resolve-Path $TradesClosedCsv).Path }
@@ -289,4 +294,4 @@ Send-MailMessage `
   -Attachments $attachments `
   -ErrorAction Stop
 
-Write-Host "[OK] Mail sent to $To ($subject)" -ForegroundColor Green
+Write-Host "[OK] Mail sent to $($toList -join ', ') ($subject)" -ForegroundColor Green
