@@ -4,13 +4,12 @@
  - run_pipeline.ps1 사전 실행(-RunPipeline)
  - trades_closed 레거시 행 교정(A/B)
  - HTML 메일 + CSV 첨부
- - 다중 수신자 콤마 분리
  표준 헤더:
  opened_at,symbol,event,side,level,closed_at,entry_price,exit_price,pnl,reason,fee
 ================================ #>
 
 param(
-  # 보고/옵션
+  # 보고 윈도우/옵션
   [int]    $SinceHours       = 24,
   [string] $TagHalf          = 'AM',
   [switch] $RunPipeline,
@@ -27,9 +26,9 @@ param(
   [string] $SmtpServer,
   [int]    $SmtpPort         = 587,
   [string] $From,
-  [string] $To,                 # 콤마로 다중 수신자 가능
+  [string] $To,
   [string] $SmtpUser,
-  [System.Security.SecureString] $SmtpPass,
+  [Security.SecureString] $SmtpPass,
   [bool]   $UseStartTls      = $true,
 
   # 제목 접두어
@@ -124,7 +123,7 @@ if ($UseEnv) {
   if (-not $To         -and $env:SMTP_TO)     { $To         = $env:SMTP_TO }
   if (-not $SmtpUser   -and $env:SMTP_USER)   { $SmtpUser   = $env:SMTP_USER }
   if (-not $SmtpPass   -and $env:SMTP_PASS)   { $SmtpPass   = ConvertTo-SecureString $env:SMTP_PASS -AsPlainText -Force }
-  if ($env:SMTP_PORT) { try { $SmtpPort = [int]$env:SMTP_PORT } catch {} }
+  if ($env:SMTP_PORT) { try { $SmtpPort   = [int]$env:SMTP_PORT } catch {} }
   if ($env:SMTP_TLS)  { try { $UseStartTls = [bool]::Parse($env:SMTP_TLS) } catch {} }
 }
 
@@ -172,7 +171,7 @@ foreach($row in $trades){
   $reason0 = $row.reason
 
   # 패턴 A: entry=quick_expired(문자), exit=0.001(수치), pnl 비어있음
-  $isEntryNumber = $row.entry_price -match '^\s*[\+\-]?\d+(\.\d+)?\s*$'
+  $isEntryNumber = "$($row.entry_price)" -match '^\s*[\+\-]?\d+(\.\d+)?\s*$'
   if (($null -eq $entry0) -and ($null -ne (Parse-Double $row.exit_price)) -and -not $isEntryNumber -and ($null -eq $pnl0)) {
     $reason0 = $row.entry_price
     $fee0    = Parse-Double $row.exit_price
@@ -273,7 +272,9 @@ $rejTable    = New-HtmlTable -Rows $rejSummary -Title "Rejects by Reason (last $
 $htmlBody    = $summaryHtml + $closedTable + $rejTable
 
 # ---------- 메일 ----------
+# 쉼표로 수신자 분리
 $toList = $To -split '\s*,\s*' | Where-Object { $_ -and $_.Trim() -ne "" }
+
 if (-not $SmtpUser) { $SmtpUser = $From }
 if (-not $SmtpPass) { $SmtpPass = Read-Host -AsSecureString -Prompt "SMTP app password for $SmtpUser" }
 $cred = New-Object System.Management.Automation.PSCredential($SmtpUser, $SmtpPass)
