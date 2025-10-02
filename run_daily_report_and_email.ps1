@@ -35,41 +35,61 @@ param(
   [string] $SubjectPrefix    = "[PaperTrader] Daily Report"
 )
 
-# --- 콘솔/파일 UTF-8 ---
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($true)
-$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
+#param(
+    [ValidateSet('AM','PM')] [string]$TagHalf = 'AM'
+)
 
+# ----- 초기화 (param 아래에서만!) -----
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# 실행 경로 안전하게 고정 (스크립트가 있는 폴더)
-$ScriptRoot = if ($PSScriptRoot) { 
-    $PSScriptRoot 
-} else { 
-    Split-Path -Parent $MyInvocation.MyCommand.Path 
+# 스크립트 루트 계산(콘솔/스케줄러/직접실행 모두 대응)
+$ScriptRoot = if ($PSScriptRoot -and $PSScriptRoot.Trim() -ne "") {
+    $PSScriptRoot
+} elseif ($MyInvocation.MyCommand.Path) {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    # 콘솔 테스트 시 fallback (네 프로젝트 루트로 맞춰줘)
+    "D:\upbit_autotrade_starter"
 }
 Set-Location -Path $ScriptRoot
 
-# 출력 인코딩 고정 (한글 깨짐 방지)
-# $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-# [Console]::OutputEncoding = $OutputEncoding
+# 출력 인코딩(한글 깨짐 방지)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $OutputEncoding
 
-# .env 파일 경로
-$envFile = Join-Path $ScriptRoot ".env"
-if (-not (Test-Path $envFile)) {
-    throw ".env 파일이 없습니다: $envFile"
-}
-
-# .env 읽어서 환경 변수로 세팅
-(Get-Content -LiteralPath $envFile -Encoding utf8) `
-| Where-Object { $_ -match '^\s*[^#].*=' } `
-| ForEach-Object {
-    if ($_ -match '^\s*([^=]+)=(.*)$') {
-        $name  = $matches[1].Trim()
-        $value = $matches[2].Trim().Trim("'`"")   # 따옴표 제거
-        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+# .env 로더 함수
+function Load-DotEnv {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$Require = @()
+    )
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw ".env 파일이 없습니다: $Path"
+    }
+    (Get-Content -LiteralPath $Path -Encoding utf8) |
+        Where-Object { $_ -match '^\s*[^#].*=' } |
+        ForEach-Object {
+            if ($_ -match '^\s*([^=]+)=(.*)$') {
+                $name  = $matches[1].Trim()
+                $value = $matches[2].Trim().Trim("'`"")  # 양끝 따옴표 제거
+                [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+            }
+        }
+    foreach ($k in $Require) {
+        if (-not [string]::IsNullOrWhiteSpace($k) -and -not $env:$k) {
+            throw "필수 환경변수 누락: $k (.env 확인)"
+        }
     }
 }
+
+# .env 로드 + 필수값 점검
+$envFile = Join-Path $ScriptRoot ".env"
+Load-DotEnv -Path $envFile -Require @('SMTP_FROM','SMTP_TO','SMTP_SERVER','SMTP_USER','SMTP_PASS')
+
+# (선택) venv 파이썬 경로 준비
+$Py = Join-Path $ScriptRoot ".venv\Scripts\python.exe"
+# -------------------------------------
 
 # 필수 SMTP 변수 확인
 $SmtpFrom  = $env:SMTP_FROM
