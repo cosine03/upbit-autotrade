@@ -39,6 +39,49 @@ param(
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($true)
 $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
 
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# 실행 경로 안전하게 고정 (스크립트가 있는 폴더)
+$ScriptRoot = if ($PSScriptRoot) { 
+    $PSScriptRoot 
+} else { 
+    Split-Path -Parent $MyInvocation.MyCommand.Path 
+}
+Set-Location -Path $ScriptRoot
+
+# 출력 인코딩 고정 (한글 깨짐 방지)
+# $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+# [Console]::OutputEncoding = $OutputEncoding
+
+# .env 파일 경로
+$envFile = Join-Path $ScriptRoot ".env"
+if (-not (Test-Path $envFile)) {
+    throw ".env 파일이 없습니다: $envFile"
+}
+
+# .env 읽어서 환경 변수로 세팅
+(Get-Content -LiteralPath $envFile -Encoding utf8) `
+| Where-Object { $_ -match '^\s*[^#].*=' } `
+| ForEach-Object {
+    if ($_ -match '^\s*([^=]+)=(.*)$') {
+        $name  = $matches[1].Trim()
+        $value = $matches[2].Trim().Trim("'`"")   # 따옴표 제거
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+    }
+}
+
+# 필수 SMTP 변수 확인
+$SmtpFrom  = $env:SMTP_FROM
+$SmtpTo    = $env:SMTP_TO
+$SmtpHost  = $env:SMTP_SERVER
+$SmtpUser  = $env:SMTP_USER
+$SmtpPass  = $env:SMTP_PASS
+
+if (-not $SmtpFrom -or -not $SmtpTo -or -not $SmtpHost -or -not $SmtpUser -or -not $SmtpPass) {
+    throw "SMTP From/To/Server/User/Pass 값이 누락되었습니다. .env 파일을 확인하세요. ($envFile)"
+}
+
 # ---------- 유틸 ----------
 function New-NowUtc { [DateTimeOffset]::UtcNow }
 
