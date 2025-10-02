@@ -1,97 +1,69 @@
-# ===== 사용자 설정 =====
-$PYTHON      = "python"                                   # venv 활성화된 셸에서 실행 권장
-$ROOT        = "."                                        # repo 루트
-$SCRIPT      = Join-Path $ROOT "replay_backtest.py"
-$SIGNALS_CSV = Join-Path $ROOT "logs\signals_tv.csv"
-$PRICES_CSV  = Join-Path $ROOT "logs\prices.csv"
-$UNIVERSE_TXT= Join-Path $ROOT "configs\universe.txt"
+# run_support_grid.ps1
+# Support 시그널용 이벤트 조합 x 만기 조합 그리드 백테스트 러너
 
-$OUT_DIR     = Join-Path $ROOT "logs\backtest\grid_support"
-$LOG_PATH    = Join-Path $OUT_DIR "run.log"
-$SUMMARY_CSV = Join-Path $OUT_DIR "summary.csv"
-
-# 공통 파라미터
-$FEE         = 0.001
-$PRICE_WIN   = 600          # REST 가격 윈도(초)
-$SIDES       = "support"    # 이번 그리드는 support만
-
-# 만기 후보 (분)
-$EXPIRIES = @(5, 10, 15, 30, 60, 120)
-
-# 이벤트 세트(모든 경우의 수)
-# key: 요약 이름 / events: 실제 인자 값
-$EVENT_SETS = @(
-  @{ key = "line";          events = "line_breakout" }
-  @{ key = "box";           events = "box_breakout" }
-  @{ key = "pib";           events = "price_in_box" }
-  @{ key = "line_box";      events = "line_breakout,box_breakout" }
-  @{ key = "box_pib";       events = "box_breakout,price_in_box" }
-  @{ key = "all";           events = "line_breakout,box_breakout,price_in_box" }
+param(
+  [string]$SignalsCsv = ".\logs\signals_tv.csv",
+  [string]$PricesCsv  = ".\logs\prices.csv",
+  [string]$Universe   = ".\configs\universe.txt",
+  [string]$OutDir     = ".\logs\backtest\support_grid",
+  [int[]] $Expiries   = @(5,10,15,30,60,120),
+  [switch]$DryRun
 )
 
-# ===== 준비 =====
-New-Item -ItemType Directory -Force -Path $OUT_DIR | Out-Null
-"=== GRID RUN @ $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Tee-Object -FilePath $LOG_PATH -Append
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
-# 요약 CSV 헤더 (없으면 생성)
-if (-not (Test-Path $SUMMARY_CSV)) {
-  "ts,side,expiry_min,events_key,events,trades,win_pct,avg_pnl,out_csv" | Set-Content -Path $SUMMARY_CSV -Encoding UTF8
-}
+# 이벤트 세트 (여기 쉼표 필수)
+$EVENT_SETS = @(
+  @{ key = "line";     events = @("line_breakout") },
+  @{ key = "box";      events = @("box_breakout") },
+  @{ key = "pib";      events = @("price_in_box") },
+  @{ key = "line_box"; events = @("line_breakout","box_breakout") },
+  @{ key = "box_pib";  events = @("box_breakout","price_in_box") },
+  @{ key = "all";      events = @("line_breakout","box_breakout","price_in_box") }
+)
 
-# ===== 실행 루프 =====
-foreach ($exp in $EXPIRIES) {
-  foreach ($es in $EVENT_SETS) {
-    $key    = $es.key
-    $events = $es.events
+# 출력 디렉토리 준비
+if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
 
-    $tag    = "{0}_exp{1}" -f $key, $exp
-    $outCsv = Join-Path $OUT_DIR ("support_{0}.csv" -f $tag)
+Write-Host "Grid: $($EVENT_SETS.Count) event-sets x $($Expiries.Count) expiries -> out=$OutDir"
 
-    $args = @(
-      $SCRIPT,
-      "--signals-csv", $SIGNALS_CSV,
-      "--prices-csv",  $PRICES_CSV,
-      "--universe",    $UNIVERSE_TXT,
-      "--sides",       $SIDES,
-      "--events",      $events,
-      "--expiry-min",  $exp,
-      "--price-window-sec", $PRICE_WIN,
-      "--fee",         $FEE,
-      "--out",         $outCsv
+foreach ($ev in $EVENT_SETS) {
+  $evKey = $ev.key
+  $evArg = ($ev.events -join ",")   # replay_backtest.py --events 형식에 맞춤
+
+  foreach ($m in $Expiries) {
+    $tag     = "support_${evKey}_exp${m}"
+    $outFile = Join-Path $OutDir "$tag.csv"
+
+    $argsList = @(
+      ".\replay_backtest.py",
+      "--signals-csv", $SignalsCsv,
+      "--prices-csv",  $PricesCsv,
+      "--universe",    $Universe,
+      "--sides",       "support",
+      "--events",      $evArg,
+      "--expiry-min",  $m,
+      "--price-window-sec", 600,
+      "--fee",         0.001,
+      "--out",         $outFile
     )
 
-    ">>> RUN  side=$SIDES  exp=${exp}m  events=$events  -> $outCsv" | Tee-Object -FilePath $LOG_PATH -Append
+    Write-Host ("`n==> {0}" -f ($argsList -join " "))
 
-    # 실행 + 표준출력 캡처
-    $proc = & $PYTHON @args 2>&1
-    $proc | Tee-Object -FilePath $LOG_PATH -Append | Out-Host
-
-    # 성과 파싱 (stdout에서 "Trades:" 라인)
-    # 예: "Trades: 55 | Win%: 49.1% | Avg PnL: 0.23%"
-    $line = $proc | Select-String -Pattern "^\s*Trades:\s*\d+\s*\|\s*Win%:\s*[\d\.]+%\s*\|\s*Avg PnL:\s*-?[\d\.]+%" -AllMatches | Select-Object -Last 1
-    if ($line) {
-      $m = [regex]::Match($line.ToString(), "Trades:\s*(\d+)\s*\|\s*Win%:\s*([\d\.]+)%\s*\|\s*Avg PnL:\s*(-?[\d\.]+)%")
-      if ($m.Success) {
-        $trades = $m.Groups[1].Value
-        $winPct = $m.Groups[2].Value
-        $avgPnl = $m.Groups[3].Value
-        $ts     = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssK")
-        "$ts,$SIDES,$exp,$key,""$events"",$trades,$winPct,$avgPnl,""$outCsv""" | Add-Content -Path $SUMMARY_CSV -Encoding UTF8
-      } else {
-        # 파싱 실패시 로그
-        "WARN: summary parse failed for $tag" | Tee-Object -FilePath $LOG_PATH -Append
-      }
-    } else {
-      "WARN: no 'Trades:' line for $tag" | Tee-Object -FilePath $LOG_PATH -Append
+    if ($DryRun) {
+      continue
     }
 
-    # 너무 빠른 연속 호출 방지 (API/IO 여유)
-    Start-Sleep -Seconds 1
+    # 실행
+    & python @argsList
+
+    if ($LASTEXITCODE -ne 0) {
+      Write-Warning "run failed for $tag (exit=$LASTEXITCODE)"
+    } else {
+      Write-Host "done -> $outFile"
+    }
   }
 }
 
-"=== DONE @ $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Tee-Object -FilePath $LOG_PATH -Append
-
-# 빠른 요약 미리보기 (선택)
-"`nTOP GRID SUMMARY (last 12 rows):" | Out-Host
-Import-Csv $SUMMARY_CSV | Select-Object -Last 12 | Format-Table ts, side, expiry_min, events_key, trades, win_pct, avg_pnl
+Write-Host "`nAll done."
