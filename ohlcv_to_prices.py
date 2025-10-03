@@ -11,7 +11,8 @@ from collections import defaultdict
 #  - KRW_ADA.csv      -> KRW-ADA
 #  - (필요시 확장 가능)
 SYMBOL_PATTERNS = [
-    re.compile(r'(?i)\b(KRW)[-_]?([A-Z0-9]+)\b'),  # KRW_ADA, KRW-ADA
+    # 예: KRW-ADA, KRW_ADA, BTC-ETH, USDT-SOL 등
+    re.compile(r'(?i)(KRW|BTC|USDT)[-_]?([A-Z0-9]+)'),
 ]
 
 def infer_symbol_from_path(path: str) -> str | None:
