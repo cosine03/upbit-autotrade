@@ -1,28 +1,22 @@
 <# ===============================
- run_daily_report_and_email.ps1 (PS5-stable)
- - .env 로드(-UseEnv)
- - run_pipeline.ps1 사전 실행(-RunPipeline)
- - trades_closed 레거시 행 교정(A/B)
- - HTML 메일 + CSV 첨부
- 표준 헤더:
- opened_at,symbol,event,side,level,closed_at,entry_price,exit_price,pnl,reason,fee
+ run_daily_report_and_email.ps1  (PowerShell 5.x safe)
+ Purpose: load .env (optional), build daily HTML report, send email.
+ Notes:
+ - ASCII-only comments (avoid mojibake)
+ - No console encoding tweaks
+ - Uses Send-MailMessage (PS5 built-in)
+ - Data sources: trades_closed.csv, rejects.csv
 ================================ #>
 
 param(
-  # 보고 윈도우/옵션
   [int]    $SinceHours       = 24,
-  [string] $TagHalf          = 'AM',
   [switch] $RunPipeline,
   [switch] $AttachCsv,
   [switch] $UseEnv,
-
-  # 경로
   [string] $SignalsCsv       = ".\logs\signals_tv.csv",
   [string] $RejectsCsv       = ".\logs\paper\rejects.csv",
   [string] $TradesOpenCsv    = ".\logs\paper\trades_open.csv",
   [string] $TradesClosedCsv  = ".\logs\paper\trades_closed.csv",
-
-  # 메일
   [string] $SmtpServer,
   [int]    $SmtpPort         = 587,
   [string] $From,
@@ -30,112 +24,38 @@ param(
   [string] $SmtpUser,
   [Security.SecureString] $SmtpPass,
   [bool]   $UseStartTls      = $true,
-
-  # 제목 접두어
-  [string] $SubjectPrefix    = "[PaperTrader] Daily Report"
+  [string] $SubjectPrefix    = "[PaperTrader] Daily Report",
+  [ValidateSet('AM','PM')] [string]$TagHalf = 'AM'
 )
 
-#param(
-    [ValidateSet('AM','PM')] [string]$TagHalf = 'AM'
-)
-
-# ----- 초기화 (param 아래에서만!) -----
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# === run_daily_report_and_email.ps1 상단에 추가 권장 ===
-
-# 1) 스크립트 디렉터리를 작업 폴더로 강제 (상대경로 안전)
-$here = Split-Path -Parent $PSCommandPath
-Set-Location -Path $here
-
-# 2) 로그 폴더 보장 (없으면 생성)
-$LogDir = Join-Path $here 'logs\scheduled'
-if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
-
-# 3) 실행 콘텍스트 점검 로그(선택)
-"[$(Get-Date -Format o)] START TagHalf=$($args -join ' '), PWD=$((Get-Location).Path)" |
-  Add-Content (Join-Path $LogDir 'report_bootstrap.log')
-
-# 스크립트 루트 계산(콘솔/스케줄러/직접실행 모두 대응)
-$ScriptRoot = if ($PSScriptRoot -and $PSScriptRoot.Trim() -ne "") {
-    $PSScriptRoot
+# Resolve script root (works for scheduler/console/direct file run)
+$ScriptRoot = if ($PSCommandPath) {
+  Split-Path -Parent $PSCommandPath
 } elseif ($MyInvocation.MyCommand.Path) {
-    Split-Path -Parent $MyInvocation.MyCommand.Path
+  Split-Path -Parent $MyInvocation.MyCommand.Path
 } else {
-    # 콘솔 테스트 시 fallback (네 프로젝트 루트로 맞춰줘)
-    "D:\upbit_autotrade_starter"
+  "D:\upbit_autotrade_starter"
 }
 Set-Location -Path $ScriptRoot
 
-# 출력 인코딩(한글 깨짐 방지)
-$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = $OutputEncoding
-
-# .env 로더 함수
-function Load-DotEnv {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [string[]]$Require = @()
-    )
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw ".env 파일이 없습니다: $Path"
-    }
-    (Get-Content -LiteralPath $Path -Encoding utf8) |
-        Where-Object { $_ -match '^\s*[^#].*=' } |
-        ForEach-Object {
-            if ($_ -match '^\s*([^=]+)=(.*)$') {
-                $name  = $matches[1].Trim()
-                $value = $matches[2].Trim().Trim("'`"")  # 양끝 따옴표 제거
-                [Environment]::SetEnvironmentVariable($name, $value, 'Process')
-            }
-        }
-    foreach ($k in $Require) {
-        if (-not [string]::IsNullOrWhiteSpace($k) -and -not $env:$k) {
-            throw "필수 환경변수 누락: $k (.env 확인)"
-        }
-    }
-}
-
-# .env 로드 + 필수값 점검
-$envFile = Join-Path $ScriptRoot ".env"
-Load-DotEnv -Path $envFile -Require @('SMTP_FROM','SMTP_TO','SMTP_SERVER','SMTP_USER','SMTP_PASS')
-
-# (선택) venv 파이썬 경로 준비
-$Py = Join-Path $ScriptRoot ".venv\Scripts\python.exe"
-# -------------------------------------
-
-# 필수 SMTP 변수 확인
-$SmtpFrom  = $env:SMTP_FROM
-$SmtpTo    = $env:SMTP_TO
-$SmtpHost  = $env:SMTP_SERVER
-$SmtpUser  = $env:SMTP_USER
-$SmtpPass  = $env:SMTP_PASS
-
-if (-not $SmtpFrom -or -not $SmtpTo -or -not $SmtpHost -or -not $SmtpUser -or -not $SmtpPass) {
-    throw "SMTP From/To/Server/User/Pass 값이 누락되었습니다. .env 파일을 확인하세요. ($envFile)"
-}
-
-# ---------- 유틸 ----------
+# -------- helpers --------
 function New-NowUtc { [DateTimeOffset]::UtcNow }
 
-function Load-DotEnv([string]$Path){
-  if (-not (Test-Path $Path)) { Write-Warning "[WARN] .env not found: $Path"; return }
-  $raw = Get-Content -Path $Path -Raw -Encoding UTF8
-  if ($raw.Length -gt 0 -and $raw[0] -eq [char]0xFEFF) { $raw = $raw.Substring(1) } # BOM 제거
-  foreach($line in $raw -split "`n"){
-    $line = $line.Trim()
-    if (-not $line -or $line.StartsWith('#')) { continue }
-    $eq = $line.IndexOf('=')
-    if ($eq -lt 1) { continue }
-    $k = $line.Substring(0,$eq).Trim()
-    $v = $line.Substring($eq+1).Trim()
-    if ($v.StartsWith('"') -and $v.EndsWith('"')) { $v = $v.Substring(1,$v.Length-2) }
-    if ($v.StartsWith("'") -and $v.EndsWith("'")) { $v = $v.Substring(1,$v.Length-2) }
-    Set-Item -Path ("Env:{0}" -f $k) -Value $v
-  }
-  Write-Host "[INFO] .env loaded (SMTP_*):" -ForegroundColor Cyan
-  Get-ChildItem Env:SMTP_* | Format-Table Name,Value -Auto
+function Load-DotEnv {
+  param([Parameter(Mandatory)][string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  (Get-Content -LiteralPath $Path -Encoding utf8) |
+    Where-Object { $_ -match '^\s*[^#].*=' } |
+    ForEach-Object {
+      if ($_ -match '^\s*([^=]+)=(.*)$') {
+        $name  = $matches[1].Trim()
+        $value = $matches[2].Trim().Trim("'`"")
+        [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+      }
+    }
 }
 
 function Parse-Double($s){
@@ -190,10 +110,11 @@ function New-HtmlTable([array]$Rows,[string]$Title,[string[]]$Columns){
   return $sb.ToString()
 }
 
-# ---------- .env -> 파라미터 보강 ----------
+# -------- .env -> parameters (optional) --------
 if ($UseEnv) {
-  $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-  Load-DotEnv -Path (Join-Path $root ".env")
+  $envFile = Join-Path $ScriptRoot ".env"
+  Load-DotEnv -Path $envFile
+
   if (-not $SmtpServer -and $env:SMTP_SERVER) { $SmtpServer = $env:SMTP_SERVER }
   if (-not $SmtpServer -and $env:SMTP_HOST)   { $SmtpServer = $env:SMTP_HOST }
   if (-not $From       -and $env:SMTP_FROM)   { $From       = $env:SMTP_FROM }
@@ -204,38 +125,34 @@ if ($UseEnv) {
   if ($env:SMTP_TLS)  { try { $UseStartTls = [bool]::Parse($env:SMTP_TLS) } catch {} }
 }
 
-# 평문 pw로 넘어오면 SecureString 변환
+# plain string password -> SecureString
 if ($SmtpPass -is [string] -and $SmtpPass) {
   $SmtpPass = ConvertTo-SecureString $SmtpPass -AsPlainText -Force
 }
 
-# 필수 체크
+# required checks
 if (-not $From -or -not $To -or -not $SmtpServer -or -not $SmtpUser -or -not $SmtpPass) {
-  throw "SMTP From/To/Server/User/Pass 중 누락이 있습니다. (.env 또는 파라미터로 채워주세요)"
+  throw "Missing SMTP fields: From/To/Server/User/Pass (set via .env or parameters)."
 }
 
-# ---------- (옵션) 사전 파이프라인 ----------
+# -------- optional pre-pipeline --------
 if ($RunPipeline) {
   try {
-    $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-    $pipe = Join-Path $root "run_pipeline.ps1"
+    $pipe = Join-Path $ScriptRoot "run_pipeline.ps1"
     if (Test-Path $pipe) {
       if ($TagHalf) { & $pipe -TagHalf $TagHalf } else { & $pipe }
-      Write-Host "[OK] Pre-pipeline executed." -ForegroundColor Green
-    } else {
-      Write-Warning "[WARN] run_pipeline.ps1 없음 - 건너뜀"
     }
   } catch {
-    Write-Warning "[WARN] 사전 파이프라인 실패: $($_.Exception.Message)"
+    Write-Warning "[WARN] run_pipeline failed: $($_.Exception.Message)"
   }
 }
 
-# ---------- 데이터 로드 ----------
+# -------- load data --------
 $cut     = (New-NowUtc).AddHours(-$SinceHours)
 $trades  = Read-CsvSafe $TradesClosedCsv
 $rejects = Read-CsvSafe $RejectsCsv
 
-# ---------- trades_closed 정규화(+레거시 교정) ----------
+# -------- normalize trades_closed (fix quick_expired / mis-ordered columns) --------
 $closedRows = @()
 foreach($row in $trades){
   $opened_at = ToDate $row.opened_at
@@ -247,7 +164,7 @@ foreach($row in $trades){
   $fee0    = Parse-Double $row.fee
   $reason0 = $row.reason
 
-  # 패턴 A: entry=quick_expired(문자), exit=0.001(수치), pnl 비어있음
+  # Case A: entry holds string(reason), exit holds fee, pnl empty
   $isEntryNumber = "$($row.entry_price)" -match '^\s*[\+\-]?\d+(\.\d+)?\s*$'
   if (($null -eq $entry0) -and ($null -ne (Parse-Double $row.exit_price)) -and -not $isEntryNumber -and ($null -eq $pnl0)) {
     $reason0 = $row.entry_price
@@ -255,7 +172,7 @@ foreach($row in $trades){
     $entry0  = $null; $exit0 = $null; $pnl0 = $null
   }
 
-  # 패턴 B: reason 자리에 pnl(숫자) 밀려온 케이스
+  # Case B: reason is numeric (actually pnl), pnl holds exit, exit holds entry
   $reasonAsNum = Parse-Double $row.reason
   if (($null -eq $entry0) -and ($null -ne $exit0) -and ($null -ne $pnl0) -and ($null -ne $reasonAsNum) -and ($null -ne $fee0)) {
     $entry0  = $exit0
@@ -278,22 +195,29 @@ foreach($row in $trades){
     fee         = $fee0
   }
 }
-$closedRows = $closedRows | Where-Object { $_.closed_at -and $_.closed_at -ge $cut } | Sort-Object closed_at
 
-# ---------- 요약 ----------
-$cnt      = $closedRows.Count
-$pnlVals  = $closedRows | ForEach-Object { $_.pnl } | Where-Object { $_ -ne $null }
-$totalPnl = if ($pnlVals){ ($pnlVals | Measure-Object -Sum).Sum } else { 0 }
-$winRows  = $closedRows | Where-Object { $_.pnl -gt 0 }
-$lossRows = $closedRows | Where-Object { $_.pnl -lt 0 }
-$flatRows = $closedRows | Where-Object { $_.pnl -eq 0 -or $_.pnl -eq $null }
-$winCnt   = $winRows.Count; $lossCnt = $lossRows.Count; $flatCnt = $flatRows.Count
-$avgWin   = if ($winRows){ ($winRows | Measure-Object -Property pnl -Average).Average } else { $null }
-$avgLoss  = if ($lossRows){ ($lossRows | Measure-Object -Property pnl -Average).Average } else { $null }
+# filter window and sort (force array)
+$closedRows = @($closedRows | Where-Object { $_.closed_at -and $_.closed_at -ge $cut } | Sort-Object closed_at)
 
-# ---------- 리젝트 요약 ----------
+# -------- simple stats (array-safe) --------
+$cnt      = @($closedRows).Count
+$pnlVals  = @($closedRows | ForEach-Object { $_.pnl } | Where-Object { $_ -ne $null })
+$totalPnl = if ($pnlVals.Count -gt 0){ ($pnlVals | Measure-Object -Sum).Sum } else { 0 }
+
+$winRows  = @($closedRows | Where-Object { $_.pnl -gt 0 })
+$lossRows = @($closedRows | Where-Object { $_.pnl -lt 0 })
+$flatRows = @($closedRows | Where-Object { $_.pnl -eq 0 -or $_.pnl -eq $null })
+
+$winCnt   = $winRows.Count
+$lossCnt  = $lossRows.Count
+$flatCnt  = $flatRows.Count
+
+$avgWin   = if ($winRows.Count  -gt 0){ ($winRows  | Measure-Object -Property pnl -Average).Average } else { $null }
+$avgLoss  = if ($lossRows.Count -gt 0){ ($lossRows | Measure-Object -Property pnl -Average).Average } else { $null }
+
+# -------- rejects summary --------
 $rejRows =
-  $rejects |
+  @($rejects |
   ForEach-Object {
     [pscustomobject]@{
       now    = (ToDate $_.now)
@@ -304,15 +228,15 @@ $rejRows =
       phase  = $_.phase
     }
   } |
-  Where-Object { $_.now -and $_.now -ge $cut }
+  Where-Object { $_.now -and $_.now -ge $cut })
 
 $rejSummary =
-  $rejRows |
+  @($rejRows |
   Group-Object reason |
   Sort-Object Count -Desc |
-  ForEach-Object { [pscustomobject]@{ reason = $_.Name; count = $_.Count } }
+  ForEach-Object { [pscustomobject]@{ reason = $_.Name; count = $_.Count } })
 
-# ---------- HTML ----------
+# -------- HTML --------
 $style = @"
 <style>
 body{font-family:Segoe UI,Arial,Helvetica,sans-serif;font-size:14px}
@@ -327,12 +251,12 @@ th,td{border:1px solid #ccc;padding:4px 6px}
 $sinceStr = $cut.ToString("u")
 $nowStr   = (New-NowUtc).ToString("u")
 $tag      = if ($TagHalf) { " $TagHalf" } else { "" }
-$subject  = "$SubjectPrefix$tag — last ${SinceHours}h (UTC)"
+$subject  = "$SubjectPrefix$tag | last ${SinceHours}h (UTC)"
 
 $summaryHtml = @"
 $style
 <h2>PaperTrader Daily Report</h2>
-<p class="small">Window: <strong>$sinceStr</strong> → <strong>$nowStr</strong> (UTC)</p>
+<p class="small">Window: <strong>$sinceStr</strong> -> <strong>$nowStr</strong> (UTC)</p>
 <h3>PNL Summary</h3>
 <ul>
   <li>Total closed trades: <strong>$cnt</strong></li>
@@ -348,29 +272,14 @@ $closedTable = New-HtmlTable -Rows $closedRows -Title "Closed Trades (last ${Sin
 $rejTable    = New-HtmlTable -Rows $rejSummary -Title "Rejects by Reason (last ${SinceHours}h)" -Columns @('reason','count')
 $htmlBody    = $summaryHtml + $closedTable + $rejTable
 
-# ---------- 메일 ----------
-# 쉼표로 수신자 분리
+# -------- send mail --------
 $toList = $To -split '\s*,\s*' | Where-Object { $_ -and $_.Trim() -ne "" }
-
 if (-not $SmtpUser) { $SmtpUser = $From }
 if (-not $SmtpPass) { $SmtpPass = Read-Host -AsSecureString -Prompt "SMTP app password for $SmtpUser" }
 $cred = New-Object System.Management.Automation.PSCredential($SmtpUser, $SmtpPass)
 
 $attachments = @()
 if ($AttachCsv -and (Test-Path $TradesClosedCsv)) { $attachments += (Resolve-Path $TradesClosedCsv).Path }
-
-# --- robust project root ---
-$ROOT =
-    if ($PSScriptRoot) { $PSScriptRoot }
-    elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath }
-    else { (Get-Location).Path }
-
-# --- logs dir + transcript ---
-$LOGDIR = Join-Path $ROOT "logs\scheduled"
-New-Item -ItemType Directory -Force -Path $LOGDIR | Out-Null
-
-# TagHalf 파라미터가 Param(...) 에서 이미 정의돼 있다고 가정
-Start-Transcript -Path (Join-Path $LOGDIR ("report_{0}.log" -f $TagHalf)) -Append | Out-Null
 
 Send-MailMessage `
   -From $From -To $toList -Subject $subject `
@@ -380,6 +289,4 @@ Send-MailMessage `
   -Attachments $attachments `
   -ErrorAction Stop
 
-Write-Host "[OK] Mail sent to $($toList -join ', ') ($subject)" -ForegroundColor Green
-
-Stop-Transcript | Out-Null
+Write-Host "[OK] Mail sent to $($toList -join ', ') ($subject)"
