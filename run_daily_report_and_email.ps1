@@ -43,6 +43,20 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# === run_daily_report_and_email.ps1 상단에 추가 권장 ===
+
+# 1) 스크립트 디렉터리를 작업 폴더로 강제 (상대경로 안전)
+$here = Split-Path -Parent $PSCommandPath
+Set-Location -Path $here
+
+# 2) 로그 폴더 보장 (없으면 생성)
+$LogDir = Join-Path $here 'logs\scheduled'
+if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
+
+# 3) 실행 콘텍스트 점검 로그(선택)
+"[$(Get-Date -Format o)] START TagHalf=$($args -join ' '), PWD=$((Get-Location).Path)" |
+  Add-Content (Join-Path $LogDir 'report_bootstrap.log')
+
 # 스크립트 루트 계산(콘솔/스케줄러/직접실행 모두 대응)
 $ScriptRoot = if ($PSScriptRoot -and $PSScriptRoot.Trim() -ne "") {
     $PSScriptRoot
