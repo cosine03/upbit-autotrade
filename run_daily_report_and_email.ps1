@@ -345,6 +345,19 @@ $cred = New-Object System.Management.Automation.PSCredential($SmtpUser, $SmtpPas
 $attachments = @()
 if ($AttachCsv -and (Test-Path $TradesClosedCsv)) { $attachments += (Resolve-Path $TradesClosedCsv).Path }
 
+# --- robust project root ---
+$ROOT =
+    if ($PSScriptRoot) { $PSScriptRoot }
+    elseif ($PSCommandPath) { Split-Path -Parent $PSCommandPath }
+    else { (Get-Location).Path }
+
+# --- logs dir + transcript ---
+$LOGDIR = Join-Path $ROOT "logs\scheduled"
+New-Item -ItemType Directory -Force -Path $LOGDIR | Out-Null
+
+# TagHalf 파라미터가 Param(...) 에서 이미 정의돼 있다고 가정
+Start-Transcript -Path (Join-Path $LOGDIR ("report_{0}.log" -f $TagHalf)) -Append | Out-Null
+
 Send-MailMessage `
   -From $From -To $toList -Subject $subject `
   -Body $htmlBody -BodyAsHtml `
@@ -354,3 +367,5 @@ Send-MailMessage `
   -ErrorAction Stop
 
 Write-Host "[OK] Mail sent to $($toList -join ', ') ($subject)" -ForegroundColor Green
+
+Stop-Transcript | Out-Null
