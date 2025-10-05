@@ -1,135 +1,154 @@
-import argparse, csv, sys, re
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+update_signals_tv_before_backtest.py
+
+Prepare signals_tv_full.csv for backtesting:
+- Normalize columns
+- Clean message text
+- Filter by symbol prefix / timeframe
+- Optionally exclude InternalHost or localhost
+- Deduplicate by key (ts|symbol|event|side|level|touches)
+- Save as signals_tv_ready.csv (UTF-8)
+
+Example:
+python update_signals_tv_before_backtest.py \
+  --input  "D:\upbit_autotrade_starter\logs\signals_tv_full.csv" \
+  --output "D:\upbit_autotrade_starter\logs\signals_tv_ready.csv" \
+  --symbol-prefix "KRW-" --timeframe "15m" \
+  --exclude-internalhost --include-localhost
+"""
+
+import argparse
+import csv
+import re
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
 
-# -------- settings --------
-REQUIRED_COLS = ["ts","event","side","level","touches","symbol","timeframe","extra","host","message","distance_pct"]
-KEY_COLS      = ["ts","symbol","event","side","level","touches"]
+REQUIRED_COLS = [
+    "ts", "event", "side", "level", "touches", "symbol",
+    "timeframe", "extra", "host", "message", "distance_pct"
+]
 
-MSG_PIPE_NOISE   = re.compile(r"\s*\|\s*[_?]+\s*")     # " | _ " / " | ?? " -> " | "
-MSG_LEAD_NOISE   = re.compile(r"^\s*[_?]+\s*")         # 앞쪽 "_" "?" 제거
-MSG_MULTI_Q      = re.compile(r"\?\?+")                # "??" -> ""
-MSG_SQUEEZE_WS   = re.compile(r"\s{2,}")               # 다중 공백 -> 하나
-INTERNAL_HOST_RX = re.compile(r"System\.Management\.Automation\.Internal\.Host", re.I)
+INTERNAL_HOST_PATTERN = re.compile(r"System\.Management\.Automation\.Internal\.Host", re.I)
 
 def clean_message(m: str) -> str:
-    if not m: return ""
-    m = MSG_PIPE_NOISE.sub(" | ", m)
-    m = MSG_LEAD_NOISE.sub("", m)
-    m = MSG_MULTI_Q.sub("", m)
-    m = MSG_SQUEEZE_WS.sub(" ", m.strip())
+    if not m:
+        return ""
+    m = re.sub(r"\s*\|\s*[_?]+\s*", " | ", m)
+    m = re.sub(r"^\s*[_?]+\s*", "", m)
+    m = re.sub(r"\?{2,}", "?", m)
+    m = re.sub(r"\s{2,}", " ", m.strip())
     return m
 
-def parse_ts_utc(s: str) -> str:
-    # 다양한 ISO8601 변형을 UTC로 normalize -> ISO8601(Z 없음, +00:00 오프로 저장)
-    # ex) 2025-09-30T18:15:25.436917+00:00 / 2025-09-30T18:15:25+00:00
-    # 실패 시 예외 -> 상위에서 스킵 또는 보고
-    dt = datetime.fromisoformat(s.replace("Z","+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    # 문자열로 환원 (백테스트 파이프와 맞춤: 마이크로초 보존)
-    if dt.microsecond:
-        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
-    return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+def canon_row(r: dict) -> dict:
+    side = (r.get("side") or r.get("type") or "").strip()
+    msg_raw = (r.get("message") or r.get("details") or r.get("source") or "")
+    msg_clean = clean_message(msg_raw)
+    host_v = (r.get("host") or r.get("origin") or r.get("source") or "").strip()
+    if INTERNAL_HOST_PATTERN.search(host_v):
+        host_v = "InternalHost"
 
-def row_key(r: dict) -> str:
-    return "|".join(r.get(k,"") for k in KEY_COLS)
+    tf = (r.get("timeframe") or "").strip()
+    extra = (r.get("extra") or "").strip()
+    dist = (r.get("distance_pct") or "").strip()
 
-def main():
+    out = {
+        "ts": (r.get("ts") or "").strip(),
+        "event": (r.get("event") or "").strip(),
+        "side": side,
+        "level": (r.get("level") or "").strip(),
+        "touches": (r.get("touches") or "").strip(),
+        "symbol": (r.get("symbol") or "").strip(),
+        "timeframe": tf,
+        "extra": extra,
+        "host": host_v,
+        "message": msg_clean,
+        "distance_pct": dist,
+    }
+    for c in REQUIRED_COLS:
+        out.setdefault(c, "")
+    return out
+
+def key_of(rec: dict, keep_host_in_key: bool = False) -> str:
+    base = "{ts}|{symbol}|{event}|{side}|{level}|{touches}".format(**{k: rec.get(k, "") for k in [
+        "ts", "symbol", "event", "side", "level", "touches"
+    ]})
+    if keep_host_in_key:
+        return base + "|" + (rec.get("host") or "")
+    return base
+
+def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input",  default=r"D:\upbit_autotrade_starter\logs\signals_tv_full.csv")
     ap.add_argument("--output", default=r"D:\upbit_autotrade_starter\logs\signals_tv_ready.csv")
-    ap.add_argument("--symbol-prefix", default="", help="예: KRW- 로 제한하려면 KRW- 지정")
-    ap.add_argument("--timeframe", default="", help="예: 15m 로 제한. 빈값이면 제한하지 않음")
-    ap.add_argument("--exclude-internalhost", action="store_true", help="InternalHost 문자열 호스트 행 제외")
-    ap.add_argument("--exclude-localhost",  action="store_true", help="127.0.0.1 행 제외(기본 미제외)")
-    ap.add_argument("--start", default="", help="UTC 시작(포함), 예: 2025-09-17T00:00:00+00:00")
-    ap.add_argument("--end",   default="", help="UTC 끝(포함),   예: 2025-10-04T23:59:59+00:00")
-    args = ap.parse_args()
+    ap.add_argument("--symbol-prefix", default="", help="Filter by symbol prefix, e.g., KRW-")
+    ap.add_argument("--timeframe", default="", help="Filter by timeframe, e.g., 15m (empty = no filter)")
+    ap.add_argument("--exclude-internalhost", action="store_true", help="Exclude InternalHost rows")
+    ap.add_argument("--include-localhost", action="store_true", help="Include 127.0.0.1 rows (default: exclude)")
+    ap.add_argument("--keep-host-in-key", action="store_true", help="Include host in dedup key")
+    return ap.parse_args()
 
+def main():
+    args = parse_args()
     src = Path(args.input)
     if not src.exists():
-        print(f"[ERR] input not found: {src}", file=sys.stderr); sys.exit(1)
+        print(f"[ERR] input not found: {src}", file=sys.stderr)
+        sys.exit(1)
 
     with src.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        # 헤더 보강(누락시 빈칸)
-        cols = list(reader.fieldnames or [])
-        for c in REQUIRED_COLS:
-            if c not in cols:
-                cols.append(c)
+        rows = list(reader)
 
-        rows_ok, dropped = [], {"missing_fields":0,"ts_parse_fail":0,"filters":0}
-        for raw in reader:
-            r = {c: raw.get(c, "") for c in cols}
+    canon = [canon_row(r) for r in rows]
 
-            # 필수 필드
-            if not r["ts"] or not r["event"] or not r["symbol"]:
-                dropped["missing_fields"] += 1; continue
+    if args.symbol_prefix:
+        canon = [r for r in canon if r["symbol"].startswith(args.symbol_prefix)]
 
-            # ts normalize(UTC)
-            try:
-                r["ts"] = parse_ts_utc(r["ts"])
-            except Exception:
-                dropped["ts_parse_fail"] += 1; continue
+    if args.timeframe:
+        canon = [r for r in canon if (not r["timeframe"]) or (r["timeframe"] == args.timeframe)]
 
-            # 심볼/타임프레임 필터
-            if args.symbol_prefix and not r["symbol"].startswith(args.symbol_prefix):
-                dropped["filters"] += 1; continue
-            if args.timeframe:
-                tf = r.get("timeframe","")
-                if tf and tf != args.timeframe:
-                    dropped["filters"] += 1; continue
+    if args.exclude_internalhost:
+        canon = [r for r in canon if r["host"] != "InternalHost"]
 
-            # 호스트 처리
-            h = r.get("host","") or ""
-            if INTERNAL_HOST_RX.search(h):
-                # 내부호스트는 “제외”가 아니라 기본은 “정상화(빈칸)” — 제외 원하면 플래그 사용
-                if args.exclude_internalhost:
-                    dropped["filters"] += 1; continue
-                r["host"] = ""  # normalize
-            if args.exclude_localhost and h == "127.0.0.1":
-                dropped["filters"] += 1; continue
+    if not args.include_localhost:
+        canon = [r for r in canon if r["host"] != "127.0.0.1"]
 
-            # 메시지 클린업
-            r["message"] = clean_message(r.get("message",""))
-
-            rows_ok.append(r)
-
-    # 중복 제거
     seen = set()
     dedup = []
-    for r in rows_ok:
-        k = row_key(r)
+    for r in canon:
+        k = key_of(r, keep_host_in_key=args.keep_host_in_key)
         if k not in seen:
             seen.add(k)
             dedup.append(r)
 
-    # ts 정렬
-    dedup.sort(key=lambda x: x["ts"])
+    def ts_key(rec):
+        t = rec.get("ts", "")
+        try:
+            return datetime.fromisoformat(t.replace("Z", "+00:00"))
+        except Exception:
+            return t
+    dedup.sort(key=ts_key)
 
-    # 저장
     dst = Path(args.output)
+    dst.parent.mkdir(parents=True, exist_ok=True)
     with dst.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=REQUIRED_COLS, quoting=csv.QUOTE_MINIMAL)
         writer.writeheader()
         for r in dedup:
-            writer.writerow({c: r.get(c,"") for c in REQUIRED_COLS})
+            writer.writerow({c: r.get(c, "") for c in REQUIRED_COLS})
 
-    # 요약
-    from collections import Counter
-    by_event = Counter(r["event"] for r in dedup)
-    by_host  = Counter(r.get("host","") for r in dedup)
-    by_day   = Counter(r["ts"][:10] for r in dedup)
+    print(f"[OK] saved: {dst} (rows={len(dedup)})")
+    by_event = {}
+    for r in dedup:
+        by_event[r["event"]] = by_event.get(r["event"], 0) + 1
+    top = sorted(by_event.items(), key=lambda x: x[1], reverse=True)
+    print("[SUMMARY] events:", ", ".join(f"{k}:{v}" for k, v in top[:6]))
 
-    print("✅ prepare_signals_tv_before_backtest: DONE")
-    print(f"- input : {src}")
-    print(f"- output: {dst}")
-    print(f"- kept  : {len(dedup)} rows")
-    print(f"- drop  : {dropped}")
-    print("- events:", dict(by_event.most_common()))
-    print("- hosts :", dict(by_host.most_common()))
-    print("- range :", dedup[0]['ts'] if dedup else "-", "→", dedup[-1]['ts'] if dedup else "-")
-    print("- days  :", len(by_day))
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERR] {e}", file=sys.stderr)
+        sys.exit(1)
